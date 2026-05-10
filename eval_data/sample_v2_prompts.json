@@ -1,0 +1,159 @@
+{
+  "_meta": "Broader 10-prompt sample picked from finance_agent_benchmark spanning all question types not heavily covered by v1 sample. Curated to 10.",
+  "prompts": [
+    {
+      "id": "what_was_the_total_b33df8",
+      "type": "Quantitative Retrieval",
+      "question": "What was the total consideration cost TKO paid to acquired Endeavor assets measured at transaction close?",
+      "rubric_concepts": [
+        [
+          "3.25"
+        ]
+      ],
+      "expert_mins": 2
+    },
+    {
+      "id": "how_many_common_stock_8921c4",
+      "type": "Quantitative Retrieval",
+      "question": "How many common stock shares are outstanding for ABNB? Format \"Class X: X shares\" add line break.",
+      "rubric_concepts": [
+        [
+          "432,876,657"
+        ],
+        [
+          "188,462,942"
+        ],
+        [
+          "Class"
+        ],
+        [
+          "9,200,000"
+        ]
+      ],
+      "expert_mins": 5
+    },
+    {
+      "id": "calculate_the_3_year_7f570d",
+      "type": "Numerical Reasoning",
+      "question": "Calculate the 3 year revenue CAGR for Palantir Technologies.",
+      "rubric_concepts": [
+        [
+          "2024",
+          "2,865,507"
+        ],
+        [
+          "2022",
+          "1,905,871"
+        ],
+        [
+          "14.56%"
+        ]
+      ],
+      "expert_mins": 5
+    },
+    {
+      "id": "what_is_the_total_791fab",
+      "type": "Numerical Reasoning",
+      "question": "What is the total amount of director compensation (in dollars) that was paid to the directors of 3D Systems in 2023?",
+      "rubric_concepts": [
+        [
+          "2023"
+        ]
+      ],
+      "expert_mins": 10
+    },
+    {
+      "id": "how_many_basis_points_f7c712",
+      "type": "Beat or Miss",
+      "question": "How many basis points did MU beat or miss its Q3 2024 GAAP gross margin guidance?",
+      "rubric_concepts": [
+        [
+          "140"
+        ]
+      ],
+      "expert_mins": 10
+    },
+    {
+      "id": "what_would_be_the_2ff49e",
+      "type": "Adjustments",
+      "question": "What would be the impact to net income in dollars and percent if all debt for Boeing in 2024 were refinanced at 3% higher interest rates than current?",
+      "rubric_concepts": [
+        [
+          "1.261"
+        ],
+        [
+          "10.7%"
+        ]
+      ],
+      "expert_mins": 15
+    },
+    {
+      "id": "for_the_fiscal_year_9c250b",
+      "type": "Adjustments",
+      "question": "For the fiscal year ended 12/31/2023, what was Uber's (NYSE: UBER) largest adjustment to EBITDA. Provide the line item and amount in billions of dollars.",
+      "rubric_concepts": [
+        [
+          "1.935B"
+        ]
+      ],
+      "expert_mins": 10
+    },
+    {
+      "id": "assuming_normal_march_seasonality_1d1683",
+      "type": "Financial Modeling",
+      "question": "Assuming normal March seasonality over last three years, will TSM beat or miss Q2 guidance and by how much?\nShow work.",
+      "rubric_concepts": [
+        [
+          "2025"
+        ],
+        [
+          "2025"
+        ],
+        [
+          "2022",
+          "17.0%"
+        ],
+        [
+          "2023",
+          "10.9%"
+        ],
+        [
+          "2024",
+          "7.5%"
+        ]
+      ],
+      "expert_mins": 60
+    },
+    {
+      "id": "what_is_the_maximum_4a92d6",
+      "type": "Financial Modeling",
+      "question": "What is the maximum dilutive impact in number of shares of Snapchat's outstanding convertible notes as of 12/31/2024?",
+      "rubric_concepts": [
+        [
+          "85,945,127"
+        ]
+      ],
+      "expert_mins": 30
+    },
+    {
+      "id": "how_has_us_steel_a395b6",
+      "type": "Market Analysis",
+      "question": "How has US Steel addressed its planned merger with Nippton Steel and its effect on its business operations?",
+      "rubric_concepts": [
+        [
+          "7.3"
+        ],
+        [
+          "Steel"
+        ],
+        [
+          "The"
+        ],
+        [
+          "2023"
+        ]
+      ],
+      "expert_mins": 30
+    }
+  ]
+}

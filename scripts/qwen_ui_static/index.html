@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qwen-ui</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- KaTeX (LaTeX rendering) — CSS first so unstyled math doesn't flash -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+        crossorigin="anonymous">
+  <!-- highlight.js dark theme; we swap to a light theme via JS in light mode -->
+  <link rel="stylesheet" id="hljs-theme"
+        href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/styles/github-dark.min.css">
+</head>
+<body data-tab="chat">
+  <header class="topbar">
+    <div class="brand">qwen-ui</div>
+    <nav class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="chat" aria-selected="true">
+        <span class="tab-icon" aria-hidden="true">💬</span>
+        <span>Chat</span>
+      </button>
+      <button class="tab" role="tab" data-tab="agents" aria-selected="false">
+        <span class="tab-icon" aria-hidden="true">⏱</span>
+        <span>Agents</span>
+        <span class="tab-badge" id="agents-tab-badge" hidden>0</span>
+      </button>
+    </nav>
+    <div class="status" aria-live="polite">
+      <span class="think-timer" id="think-timer" hidden
+            title="time the model has spent on this turn">0.0s</span>
+      <span class="compact-indicator" id="compact-indicator" hidden
+            title="auto-compacting context — one upstream summarization call">
+        <span class="compact-spinner"></span>
+        <span class="compact-label">Compacting…</span>
+      </span>
+      <div class="context-bar" id="context-bar" hidden
+           title="how full the model's context window is">
+        <div class="context-bar-fill" id="context-bar-fill"></div>
+        <span class="context-bar-label" id="context-bar-label">0 / 256k</span>
+      </div>
+      <span class="dot" id="health-dot" data-state="loading" title="upstream"></span>
+      <span class="model" id="model-label">…</span>
+      <span class="queue" id="queue-label" hidden>queue: 0</span>
+      <button class="icon-btn" id="theme-toggle"
+              title="toggle light/dark theme (cmd-shift-D)" aria-label="toggle theme">
+        <span id="theme-toggle-icon">🌗</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ============================ CHAT TAB ============================ -->
+  <main class="view view-chat" id="view-chat" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>Sessions</span>
+        <span class="sidebar-head-actions">
+          <button class="icon-btn" id="remember-btn"
+                  title="extract durable facts from this chat into long-term memory">💾</button>
+          <button class="icon-btn" id="export-btn"
+                  title="export this chat as Markdown">⤓</button>
+          <button class="icon-btn" id="new-chat-btn" title="new chat">+</button>
+        </span>
+      </div>
+      <div class="sidebar-search">
+        <input type="search" id="session-search"
+               placeholder="search sessions…"
+               aria-label="filter sessions by title or content"
+               autocomplete="off">
+      </div>
+      <ul class="session-list" id="session-list">
+        <li class="empty">no past sessions</li>
+      </ul>
+    </aside>
+    <section class="main">
+      <div class="transcript" id="transcript" aria-live="polite">
+        <div class="welcome">
+          <h2>Start a conversation</h2>
+          <p>Ask anything. The model has tools and can browse, edit files, and run code.</p>
+          <div class="quick-starts">
+            <button class="quick-start" data-prompt="Summarize the abstract of arXiv 2401.12345 in two paragraphs.">
+              <span class="quick-start-label">📄 Summarize a paper</span>
+              <span class="quick-start-sub">arXiv id, DOI, or PDF path</span>
+            </button>
+            <button class="quick-start" data-prompt="Search arxiv for recent work on speculative decoding for MoE models. Pick the 2 most relevant and give me the abstracts.">
+              <span class="quick-start-label">🔬 Find recent papers</span>
+              <span class="quick-start-sub">topic search via arxiv_search</span>
+            </button>
+            <button class="quick-start" data-prompt="Outline the structure of https://arxiv.org/html/2401.04088 — just heading hierarchy, no body.">
+              <span class="quick-start-label">🧭 Outline a webpage</span>
+              <span class="quick-start-sub">cheap before you fetch</span>
+            </button>
+            <button class="quick-start" data-prompt="What's in /tmp/data.csv? Show shape, column types, first 10 rows, and numeric stats.">
+              <span class="quick-start-label">📊 Inspect a CSV</span>
+              <span class="quick-start-sub">csv_summary tool</span>
+            </button>
+            <button class="quick-start" data-prompt="Check the README of mlx-lm on github and explain what's new in the latest commits.">
+              <span class="quick-start-label">📦 Read a GitHub repo</span>
+              <span class="quick-start-sub">github_repo direct API</span>
+            </button>
+            <button class="quick-start" data-prompt="What time is it in New York, London, and Tokyo right now?">
+              <span class="quick-start-label">🕓 Time math</span>
+              <span class="quick-start-sub">timezone-aware now()</span>
+            </button>
+            <button class="quick-start" data-prompt="List my graphs with agent_graph_list, then run market_research with topic='today's tech sector'.">
+              <span class="quick-start-label">🕸 Run a graph</span>
+              <span class="quick-start-sub">multi-agent workflow</span>
+            </button>
+            <button class="quick-start" data-prompt="Use make_table to compare 3 popular Python web frameworks (Django, FastAPI, Flask): year released, async support, sweet spot.">
+              <span class="quick-start-label">📋 Build a table</span>
+              <span class="quick-start-sub">make_table tool</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <form class="composer" id="composer" autocomplete="off">
+        <div class="composer-attachments" id="attachments" hidden></div>
+        <div class="composer-row">
+          <button type="button" class="composer-attach-btn" id="attach-btn"
+                  title="attach files (PDF, code, text…)">📎</button>
+          <input type="file" id="attach-input" multiple hidden
+                 accept=".pdf,.txt,.md,.markdown,.rst,.tex,.py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.c,.cc,.cpp,.h,.hpp,.swift,.rb,.sh,.bash,.json,.yaml,.yml,.toml,.csv,.tsv,.xml,.html,.css,.sql,.log,application/pdf,text/*">
+          <textarea
+            id="composer-input"
+            placeholder="Send a message…   (⌘↵ to send, Esc to abort streaming)"
+            rows="1"></textarea>
+          <button type="submit" class="send-btn" id="send-btn" disabled>Send</button>
+        </div>
+        <div class="composer-droppable" id="composer-droppable" hidden>
+          drop files to attach
+        </div>
+        <div class="composer-foot" aria-hidden="true">
+          <span class="foot-hint" id="composer-token-hint" hidden>~0 tokens</span>
+          <span class="foot-spacer"></span>
+          <span class="foot-hint"><kbd>⌘↵</kbd> send</span>
+          <span class="foot-hint"><kbd>⌘K</kbd> focus</span>
+          <span class="foot-hint"><kbd>⌘L</kbd> new chat</span>
+          <span class="foot-hint"><kbd>⌘⇧D</kbd> theme</span>
+          <span class="foot-hint"><kbd>Esc</kbd> abort</span>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <!-- =========================== AGENTS TAB =========================== -->
+  <main class="view view-agents" id="view-agents" hidden>
+    <div class="view-banner agents-banner" role="note">
+      <span class="banner-icon" aria-hidden="true">⏱</span>
+      <span class="banner-text">
+        <strong>Continuous agents + Graphs.</strong>
+        Schedule recurring agents; design multi-agent graphs from a
+        description (then edit the auto-proposed architecture) or build
+        them by hand; register custom MCPs.
+      </span>
+      <span class="banner-stat" id="agents-banner-stat" hidden></span>
+    </div>
+    <div class="view-body">
+      <aside class="sidebar">
+        <div class="sidebar-section">
+          <div class="sidebar-head">
+            <span>My Agents</span>
+            <button class="icon-btn" id="new-agent-btn" title="new agent">+</button>
+          </div>
+          <ul class="agent-list" id="agent-list">
+            <li class="empty">no agents yet</li>
+          </ul>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-head">
+            <span>Graphs</span>
+            <span class="sidebar-head-actions">
+              <button class="icon-btn" id="build-graph-btn"
+                      title="build a graph from scratch (manual node editor)"
+                      aria-label="build a graph manually">⚙</button>
+              <button class="icon-btn" id="new-graph-btn"
+                      title="design a graph from a description (LLM)"
+                      aria-label="design a graph from a description">+</button>
+            </span>
+          </div>
+          <ul class="graph-list" id="graph-list">
+            <li class="empty">loading…</li>
+          </ul>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-head">
+            <span>MCPs</span>
+            <button class="icon-btn" id="new-mcp-btn" title="register a custom MCP">+</button>
+          </div>
+          <ul class="mcp-list" id="mcp-list">
+            <li class="empty">none registered</li>
+          </ul>
+        </div>
+      </aside>
+      <section class="main">
+        <div class="agent-detail empty" id="agent-detail">
+          <div class="welcome">
+            <div class="welcome-icon" aria-hidden="true">⏱</div>
+            <h2>Pick an agent or graph</h2>
+            <p>On the left: schedule a continuous agent, design a graph,
+               register an MCP. Graphs decompose a complex task into small
+               specialized agents — each with its own tailored prompt and
+               minimal context — so a 50-tool monolithic prompt becomes a
+               clean DAG.</p>
+            <div class="welcome-actions">
+              <button class="primary-btn" id="welcome-new-agent">+ New agent</button>
+              <button class="primary-btn" id="welcome-new-graph">+ Design a graph</button>
+              <button class="primary-btn" id="welcome-build-graph">⚙ Build a graph</button>
+            </div>
+            <div class="welcome-examples">
+              <p class="welcome-eyebrow">Examples</p>
+              <ul>
+                <li><code>graph</code> · "research X then write a 3-section blog post"</li>
+                <li><code>graph</code> · "review a python file: structure → concerns → patch plan"</li>
+                <li><code>agent</code> · poll Gmail every 10 min, summarize to <code>~/digest.md</code></li>
+              </ul>
+            </div>
+            <div class="welcome-archive" id="welcome-archive">
+              <div class="welcome-archive-head">
+                <p class="welcome-eyebrow">Outputs archive</p>
+                <div class="welcome-archive-controls">
+                  <input type="search" id="archive-filter"
+                         class="archive-filter"
+                         placeholder="filter by graph name…">
+                  <button class="icon-btn" id="archive-refresh-btn"
+                          title="refresh archive" aria-label="refresh">⟳</button>
+                </div>
+              </div>
+              <ul class="archive-list" id="archive-list">
+                <li class="empty">no runs yet</li>
+              </ul>
+              <button id="archive-load-more" class="archive-load-more" hidden>
+                Load older
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- =========================== NEW AGENT MODAL ====================== -->
+  <dialog class="modal" id="agent-modal">
+    <form id="agent-form" method="dialog">
+      <header class="modal-head">
+        <h3 id="agent-modal-title">New agent</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <label>
+          <span>Name</span>
+          <input name="name" type="text" required maxlength="60"
+                 placeholder="monitor email">
+        </label>
+        <label>
+          <span>Goal / prompt</span>
+          <textarea name="prompt" required rows="6"
+                    placeholder="Each cycle: check ~/Inbox for new files, summarize them into ~/digest.md, and append a timestamped entry."></textarea>
+        </label>
+        <label>
+          <span>Working directory</span>
+          <input name="cwd" type="text" required
+                 placeholder="/Users/me/work">
+        </label>
+        <label>
+          <span>Interval (seconds)</span>
+          <input name="interval_seconds" type="number" min="60" step="30"
+                 value="600" required>
+        </label>
+        <label class="checkbox-row">
+          <input name="enabled" type="checkbox" checked>
+          <span>Enabled — run on schedule once created</span>
+        </label>
+        <p class="hint">
+          Cycles get ±20% timing jitter so agents don't lock-step. Minimum
+          interval is 60s; only one agent runs at a time (single-GPU
+          serialization). The agent keeps running even after you close
+          this tab.
+        </p>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit" class="primary-btn">Create</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== NEW GRAPH MODAL (DESIGN) ============= -->
+  <dialog class="modal" id="graph-modal">
+    <form id="graph-form" method="dialog">
+      <header class="modal-head">
+        <h3>Design a graph</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <label>
+          <span>Describe what you want, in plain English</span>
+          <textarea name="description" required rows="5"
+                    placeholder="A graph that takes a stock ticker, fetches recent news, identifies 2-3 themes, and writes a 200-word brief."></textarea>
+        </label>
+        <p class="hint">
+          The model will design the smallest correct DAG. You'll see the
+          proposed nodes/tools/edges in the next step and can edit them
+          before saving.
+        </p>
+        <div class="design-status" id="graph-design-status" hidden></div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit" class="primary-btn" id="graph-design-btn">Preview</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== GRAPH PREVIEW/EDIT MODAL ============ -->
+  <dialog class="modal modal-wide" id="graph-preview-modal">
+    <form id="graph-preview-form" method="dialog">
+      <header class="modal-head">
+        <h3>Review graph architecture</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <p class="hint">
+          The auto-generator proposed this structure. Edit any field, add
+          or remove nodes/edges, then save. Saving validates the spec and
+          writes <code>examples/&lt;name&gt;_graph.py</code>.
+        </p>
+        <label>
+          <span>Graph name (snake_case)</span>
+          <input type="text" id="gpv-name" pattern="[a-z][a-z0-9_]*"
+                 maxlength="60" required>
+        </label>
+        <details class="graph-diagram-wrap" open>
+          <summary><strong>Diagram</strong> <span class="muted">(updates as you edit)</span></summary>
+          <div class="graph-diagram" id="gpv-diagram"></div>
+        </details>
+        <div id="gpv-nodes-wrap">
+          <div class="gpv-section-head">
+            <strong>Nodes</strong>
+            <button type="button" class="icon-btn" id="gpv-add-node"
+                    title="add node">+</button>
+          </div>
+          <ol id="gpv-nodes" class="gpv-node-list"></ol>
+        </div>
+        <div id="gpv-edges-wrap">
+          <div class="gpv-section-head">
+            <strong>Edges</strong>
+            <button type="button" class="icon-btn" id="gpv-add-edge"
+                    title="add edge">+</button>
+          </div>
+          <ol id="gpv-edges" class="gpv-edge-list"></ol>
+        </div>
+        <details class="gpv-code">
+          <summary>Generated Python (preview)</summary>
+          <pre id="gpv-code"></pre>
+        </details>
+        <div class="design-status" id="gpv-status" hidden></div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Cancel</button>
+        <button type="button" id="gpv-regen">Regenerate</button>
+        <button type="submit" class="primary-btn" id="gpv-save-btn">Save graph</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== BUILD-FROM-SCRATCH MODAL ============= -->
+  <dialog class="modal modal-wide" id="graph-build-modal">
+    <form id="graph-build-form" method="dialog">
+      <header class="modal-head">
+        <h3>Build a graph manually</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <p class="hint">
+          Compose nodes by hand. Each node is one specialized agent with
+          its own goal, inputs, outputs, and (optional) tool subset. Edges
+          define data flow.
+        </p>
+        <label>
+          <span>Graph name (snake_case)</span>
+          <input type="text" id="gb-name" pattern="[a-z][a-z0-9_]*"
+                 maxlength="60" required placeholder="my_pipeline">
+        </label>
+        <label>
+          <span>Description (optional)</span>
+          <input type="text" id="gb-desc" maxlength="200"
+                 placeholder="What does this graph do?">
+        </label>
+        <details class="graph-diagram-wrap" open>
+          <summary><strong>Diagram</strong> <span class="muted">(updates as you edit)</span></summary>
+          <div class="graph-diagram" id="gb-diagram"></div>
+        </details>
+        <div id="gb-nodes-wrap">
+          <div class="gpv-section-head">
+            <strong>Nodes</strong>
+            <button type="button" class="icon-btn" id="gb-add-node">+</button>
+          </div>
+          <ol id="gb-nodes" class="gpv-node-list"></ol>
+        </div>
+        <div id="gb-edges-wrap">
+          <div class="gpv-section-head">
+            <strong>Edges</strong>
+            <button type="button" class="icon-btn" id="gb-add-edge">+</button>
+          </div>
+          <ol id="gb-edges" class="gpv-edge-list"></ol>
+        </div>
+        <div class="design-status" id="gb-status" hidden></div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit" class="primary-btn" id="gb-save-btn">Save graph</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== ARCHIVED RUN MODAL ================= -->
+  <dialog class="modal modal-wide" id="archive-modal">
+    <form id="archive-form" method="dialog">
+      <header class="modal-head">
+        <h3 id="archive-title">Run · …</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <div id="archive-meta" class="archive-meta"></div>
+        <details class="graph-diagram-wrap" open>
+          <summary><strong>Diagram</strong></summary>
+          <div class="graph-diagram" id="archive-diagram"></div>
+        </details>
+        <details open>
+          <summary><strong>Inputs</strong></summary>
+          <div id="archive-inputs" class="archive-section"></div>
+        </details>
+        <details open>
+          <summary><strong>Outputs</strong> <span class="muted" id="archive-outputs-count"></span></summary>
+          <div id="archive-outputs" class="archive-section"></div>
+        </details>
+        <details>
+          <summary><strong>Events</strong> <span class="muted" id="archive-events-count"></span></summary>
+          <div id="archive-events" class="archive-section"></div>
+        </details>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Close</button>
+        <button type="button" id="archive-rerun-btn" class="primary-btn">Re-run</button>
+        <button type="button" id="archive-delete-btn" class="warn-btn">Delete</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== RUN GRAPH MODAL ===================== -->
+  <dialog class="modal" id="graph-run-modal">
+    <form id="graph-run-form" method="dialog">
+      <header class="modal-head">
+        <h3 id="graph-run-title">Run graph</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <div class="graph-summary" id="graph-run-summary"></div>
+        <div id="graph-run-inputs"></div>
+        <div class="graph-events" id="graph-run-events" hidden></div>
+        <div class="graph-output" id="graph-run-output" hidden></div>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Close</button>
+        <button type="submit" class="primary-btn" id="graph-run-btn">Run</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- =========================== NEW MCP MODAL ======================= -->
+  <dialog class="modal" id="mcp-modal">
+    <form id="mcp-form" method="dialog">
+      <header class="modal-head">
+        <h3>Register MCP</h3>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <label>
+          <span>Short name (lowercase, no spaces)</span>
+          <input name="name" type="text" required pattern="[a-z][a-z0-9_]{0,30}"
+                 placeholder="weather">
+        </label>
+        <label>
+          <span>Server URL</span>
+          <input name="url" type="url" required placeholder="http://127.0.0.1:9100">
+        </label>
+        <label>
+          <span>Tools (JSON array)</span>
+          <textarea name="tools" rows="6"
+                    placeholder='[{"name":"forecast","description":"5-day forecast","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'></textarea>
+        </label>
+        <p class="hint">
+          Each tool becomes <code>mcp_&lt;name&gt;__&lt;tool&gt;</code> in the chat. Args
+          are POSTed as JSON to <code>&lt;url&gt;/tools/&lt;tool&gt;</code>.
+        </p>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit" class="primary-btn">Register</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Render libs. Order matters: marked first (and its KaTeX extension,
+       which must load AFTER marked & katex but BEFORE app.js so we can
+       call marked.use(...) at module init). All sync so they run before
+       app.js (which is `type=module`, deferred). -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+          crossorigin="anonymous"></script>
+  <!-- marked-katex-extension hooks into marked's tokenizer so math is
+       extracted BEFORE markdown formatting touches it. Without this,
+       `$x_1$` would become `$x<em>1</em>$` and never render as LaTeX. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.1.4/lib/index.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.10.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="/static/app.js" type="module"></script>
+
+  <!-- Image lightbox lives outside the transcript so it overlays everything. -->
+  <div id="lightbox" class="lightbox" hidden>
+    <button class="lightbox-close" type="button" aria-label="close">×</button>
+    <img id="lightbox-img" alt="">
+  </div>
+</body>
+</html>

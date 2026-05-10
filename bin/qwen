@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# qwen — launcher for the local Qwen3.6 server with DFlash speculative
+# decoding (Multi-Token Prediction). The legacy oq6 + mlx-openai-server
+# setup is available as `qwen-legacy`.
+#
+# Usage:
+#   qwen                Open the agent REPL (autostarts daemon if needed).
+#   qwen agent [DIR]    Same; explicit.
+#   qwen chat  [DIR]    Plain chat REPL (no tools).
+#   qwen start          Run server in foreground.
+#   qwen start -d       Run server detached.
+#   qwen stop           Stop the daemon.
+#   qwen restart        Stop + start daemon.
+#   qwen status         Show running state.
+#   qwen logs [-f]      Tail logs.
+#   qwen bench          Run benchmark suite against the daemon.
+#   qwen ui [--port N]  Start the local web UI + agent supervisor (foreground).
+#   qwen ui-stop        Stop the agent supervisor (UI quits on its own).
+#   qwen ui-status      Show UI / supervisor / inference daemon status.
+#   qwen -h | --help    This help.
+
+set -euo pipefail
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+PROJECT_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+VENV_DIR="$PROJECT_ROOT/venv"
+LOG_DIR="$PROJECT_ROOT/logs"
+LOG_FILE="$LOG_DIR/server.log"
+PID_FILE="$LOG_DIR/server.pid"
+CONFIG_FILE="$PROJECT_ROOT/config/qwen.conf"
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a; source "$CONFIG_FILE"; set +a
+fi
+
+: "${QWEN_HOST:=127.0.0.1}"
+: "${QWEN_PORT:=8000}"
+# Internal port dflash-serve binds to. The proxy listens on $QWEN_PORT and
+# forwards to this. Override only if 8002 conflicts on your machine.
+: "${QWEN_UPSTREAM_PORT:=8002}"
+: "${QWEN_MODEL_PATH:=./models/Qwen3.6-35B-A3B-4bit}"
+: "${QWEN_DRAFT_MODEL_PATH:=./models/Qwen3.6-35B-A3B-DFlash}"
+: "${QWEN_MODEL_NAME:=qwen3.6}"
+
+mkdir -p "$LOG_DIR"
+
+ensure_venv() {
+  if [ ! -f "$VENV_DIR/bin/activate" ]; then
+    echo "qwen: venv not found at $VENV_DIR" >&2
+    exit 1
+  fi
+}
+
+# Args passed to dflash-serve. The --port is set by the daemon orchestrator,
+# so we omit it here and only emit model-specific flags.
+server_args() {
+  printf '%s\0' \
+    --model "$QWEN_MODEL_PATH" \
+    --draft "$QWEN_DRAFT_MODEL_PATH"
+}
+
+is_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+is_serving() {
+  curl -fsS -m 1 "http://$QWEN_HOST:$QWEN_PORT/v1/models" 2>/dev/null \
+    | grep -q "qwen3.6\|Qwen3"
+}
+
+list_descendants() {
+  local pid=$1
+  local kids
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  echo "$pid"
+  for k in $kids; do list_descendants "$k"; done
+}
+
+cmd_start() {
+  local detach=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--detach|--daemon) detach=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "qwen: unknown start option: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  ensure_venv
+
+  if is_running; then
+    echo "qwen: already running (pid $(cat "$PID_FILE")) on $QWEN_HOST:$QWEN_PORT"
+    exit 0
+  fi
+  if is_serving; then
+    echo "qwen: port $QWEN_PORT is busy — stop the other server first (e.g. \`qwen stop\`)" >&2
+    exit 1
+  fi
+
+  local args=()
+  while IFS= read -r -d '' a; do args+=("$a"); done < <(server_args)
+
+  local daemon_script="$PROJECT_ROOT/scripts/_qwen_daemon.py"
+  local proxy_script="$PROJECT_ROOT/scripts/qwen_proxy.py"
+
+  if [ "$detach" -eq 1 ]; then
+    echo "qwen: starting daemon on $QWEN_HOST:$QWEN_PORT (proxy → dflash-serve@$QWEN_UPSTREAM_PORT, logs: $LOG_FILE)"
+    (
+      cd "$PROJECT_ROOT"
+      # shellcheck disable=SC1091
+      source "$VENV_DIR/bin/activate"
+      nohup python "$daemon_script" \
+        --public-host "$QWEN_HOST" \
+        --public-port "$QWEN_PORT" \
+        --upstream-port "$QWEN_UPSTREAM_PORT" \
+        --proxy-script "$proxy_script" \
+        -- "${args[@]}" >>"$LOG_FILE" 2>&1 &
+      echo $! > "$PID_FILE"
+    )
+    sleep 1
+    if is_running; then
+      echo "qwen: started (pid $(cat "$PID_FILE"))"
+    else
+      echo "qwen: failed to start — check $LOG_FILE" >&2
+      rm -f "$PID_FILE"
+      exit 1
+    fi
+  else
+    cd "$PROJECT_ROOT"
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    echo "qwen: starting on $QWEN_HOST:$QWEN_PORT (proxy → dflash-serve@$QWEN_UPSTREAM_PORT, Ctrl-C to stop)"
+    exec python "$daemon_script" \
+      --public-host "$QWEN_HOST" \
+      --public-port "$QWEN_PORT" \
+      --upstream-port "$QWEN_UPSTREAM_PORT" \
+      --proxy-script "$proxy_script" \
+      -- "${args[@]}"
+  fi
+}
+
+cmd_stop() {
+  local pids="" pid=""
+  if is_running; then
+    pid="$(cat "$PID_FILE")"
+    pids="$(list_descendants "$pid" | sort -u | tr '\n' ' ')"
+  fi
+  if [ -z "$pids" ]; then
+    echo "qwen: not running"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  echo "qwen: stopping"
+  if [ -n "$pid" ]; then
+    kill -INT "-$pid" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC2086
+  kill -INT $pids 2>/dev/null || true
+  for _ in 1 2 3 4 5 6; do
+    local alive=""
+    for p in $pids; do
+      kill -0 "$p" 2>/dev/null && alive="$alive $p"
+    done
+    [ -z "$alive" ] && break
+    pids="$alive"
+    sleep 0.5
+  done
+  for p in $pids; do
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  done
+  rm -f "$PID_FILE"
+  echo "qwen: stopped"
+}
+
+cmd_status() {
+  if is_running; then
+    echo "qwen: running (pid $(cat "$PID_FILE")) on $QWEN_HOST:$QWEN_PORT"
+  else
+    echo "qwen: stopped"
+    [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
+cmd_logs() {
+  if [ ! -f "$LOG_FILE" ]; then
+    echo "qwen: no log file at $LOG_FILE" >&2
+    exit 1
+  fi
+  case "${1:-}" in
+    -f|--follow) tail -f "$LOG_FILE" ;;
+    "") tail -n 200 "$LOG_FILE" ;;
+    *) echo "qwen: unknown logs option: $1" >&2; exit 2 ;;
+  esac
+}
+
+wait_ready() {
+  local timeout="${1:-180}"
+  local deadline=$((SECONDS + timeout))
+  printf "qwen: waiting for model"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS -m 1 "http://$QWEN_HOST:$QWEN_PORT/v1/models" >/dev/null 2>&1; then
+      printf " ✓\n"
+      return 0
+    fi
+    printf "."
+    sleep 1
+  done
+  printf " timeout\n"
+  return 1
+}
+
+ensure_serving() {
+  if is_serving; then return 0; fi
+  cmd_start --detach
+  if ! wait_ready 180; then
+    echo "qwen: server failed to become ready — check \`qwen logs\`" >&2
+    exit 1
+  fi
+  echo "qwen: server running in background (use \`qwen stop\` to halt)"
+  # Pre-warm APC with the agent / chat system prompts. Costs ~700ms once;
+  # saves ~40ms TTFT on the first request to each prompt family. Disable
+  # with QWEN_WARM_DISABLE=1.
+  if [ -z "${QWEN_WARM_DISABLE:-}" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    QWEN_WARM_URL="http://127.0.0.1:$QWEN_UPSTREAM_PORT" \
+      "$VENV_DIR/bin/python" "$PROJECT_ROOT/scripts/warm_prompts.py" 2>&1 \
+      | sed 's/^/qwen: warm: /' || true
+  fi
+}
+
+maybe_chdir() {
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    if [ ! -d "$1" ]; then
+      echo "qwen: not a directory: $1" >&2
+      exit 2
+    fi
+    cd "$1"
+  fi
+}
+
+cmd_chat() {
+  maybe_chdir "$@"
+  ensure_serving
+  ensure_venv
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export QWEN_HOST QWEN_PORT QWEN_MODEL_NAME
+  exec python "$PROJECT_ROOT/scripts/chat.py"
+}
+
+cmd_agent() {
+  maybe_chdir "$@"
+  ensure_serving
+  ensure_venv
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export QWEN_HOST QWEN_PORT QWEN_MODEL_NAME
+  exec python -u "$PROJECT_ROOT/scripts/agent.py"
+}
+
+cmd_bench() {
+  ensure_serving
+  ensure_venv
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export QWEN_HOST QWEN_PORT QWEN_MODEL_NAME
+  exec python "$PROJECT_ROOT/scripts/benchmark.py"
+}
+
+cmd_eval() {
+  ensure_serving
+  ensure_venv
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export QWEN_HOST QWEN_PORT QWEN_MODEL_NAME
+  exec python "$PROJECT_ROOT/scripts/quality_eval.py"
+}
+
+# qwen ui — boot the local web UI (chat + continuous agents).
+#
+#   1. Make sure the inference daemon is up (so chat actually works).
+#   2. Make sure the agent supervisor is up (so saved agents keep firing
+#      even after the UI server exits).
+#   3. Run the UI server in the foreground so Ctrl-C cleanly stops it.
+#      The supervisor is intentionally left running across UI exits —
+#      that's the whole point of agents-as-daemons. To stop the
+#      supervisor explicitly, run `qwen ui-stop`.
+#
+# Usage:
+#   qwen ui [--port 8001]           start the UI (foreground)
+#   qwen ui-stop                    stop the agent supervisor too
+#   qwen ui-status                  show UI + supervisor state
+ensure_supervisor() {
+  local pid_file="$HOME/.qwen/agent_supervisor.pid"
+  if [ -f "$pid_file" ]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    # stale pid
+    rm -f "$pid_file"
+  fi
+  mkdir -p "$HOME/.qwen"
+  local sup_log="$HOME/.qwen/agent_supervisor.log"
+  ensure_venv
+  echo "qwen ui: starting agent supervisor (logs: $sup_log)"
+  nohup "$VENV_DIR/bin/python" \
+    "$PROJECT_ROOT/scripts/qwen_agent_supervisor.py" --foreground \
+    >> "$sup_log" 2>&1 < /dev/null &
+  disown $! 2>/dev/null || true
+  # wait for it to bind
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS -m 0.5 http://127.0.0.1:8003/status >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "qwen ui: supervisor failed to start — see $sup_log" >&2
+  return 1
+}
+
+cmd_ui() {
+  local port=8001
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--port) port="$2"; shift 2 ;;
+      -h|--help)
+        echo "usage: qwen ui [--port 8001]"; exit 0 ;;
+      *) echo "qwen ui: unknown option: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # If something already serves /api/health on this port, treat it as
+  # an existing qwen-ui — print the URL and exit success rather than
+  # racing for the bind and crashing with EADDRINUSE.
+  if curl -fsS -m 0.4 "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+    echo "qwen ui: already running at http://127.0.0.1:$port"
+    echo "qwen ui:   to restart, run \`qwen-ui restart\`  (or pick a different --port)"
+    exit 0
+  fi
+
+  # Port held by something other than qwen-ui? Don't try to bind.
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "qwen ui: port $port is in use by another process:" >&2
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +1 >&2
+    echo "qwen ui: free it (e.g. \`lsof -nP -iTCP:$port -sTCP:LISTEN\`, kill the holder)" >&2
+    echo "qwen ui:   or pick another port with \`qwen-ui --port N\`" >&2
+    exit 1
+  fi
+
+  # Inference (port 8000) is needed for chat to work, but the UI itself
+  # can still start without it — sessions, agents, and the file proxy all
+  # work standalone. So if we can't bring inference up cleanly (port held
+  # by a half-dead worker, model still loading, etc), warn loudly but
+  # don't bail. The UI's health probe will surface the real state.
+  if is_serving; then
+    :  # already up — nothing to do
+  elif lsof -nP -iTCP:"$QWEN_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "qwen ui: WARNING — port $QWEN_PORT is held by another process but not"  >&2
+    echo "qwen ui:   responding to /v1/models. Chat won't work until inference"   >&2
+    echo "qwen ui:   recovers. Try \`qwen restart\` to reload the model server."  >&2
+  else
+    # nothing on 8000 — try to start. If start itself fails, warn and continue.
+    if ! ( ensure_serving ); then
+      echo "qwen ui: WARNING — could not start inference. UI starts anyway;" >&2
+      echo "qwen ui:   chat will be disabled until you run \`qwen start\`."  >&2
+    fi
+  fi
+  ensure_supervisor
+  ensure_venv
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export QWEN_HOST QWEN_PORT QWEN_MODEL_NAME
+  echo "qwen ui: serving http://127.0.0.1:$port  (Ctrl-C to stop)"
+  echo "qwen ui:  supervisor: http://127.0.0.1:8003"
+  exec python -u "$PROJECT_ROOT/scripts/qwen_ui.py" --port "$port"
+}
+
+cmd_ui_restart() {
+  # Stop any qwen_ui.py we own — only ours, not random python on 8001.
+  local pids
+  pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+  if [ -n "$pids" ]; then
+    echo "qwen ui: stopping $(echo "$pids" | wc -w | tr -d ' ') running UI process(es)"
+    # shellcheck disable=SC2086
+    kill -INT $pids 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+      [ -z "$pids" ] && break
+      sleep 0.4
+    done
+    pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+    [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+  fi
+  exec "$0" ui "$@"
+}
+
+cmd_ui_stop() {
+  local pid_file="$HOME/.qwen/agent_supervisor.pid"
+  if [ -f "$pid_file" ]; then
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "qwen ui-stop: stopping supervisor pid=$pid"
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.4
+      done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+  fi
+  echo "qwen ui-stop: supervisor stopped"
+}
+
+cmd_ui_status() {
+  # 3s timeouts here (vs 0.5s previously) so a busy upstream — when the UI's
+  # health probe has to refresh against a model that's mid-generation —
+  # doesn't make us false-report "down". The actual UI server still responds
+  # in milliseconds; only the upstream-probe path takes ~2s on cache miss.
+  if curl -fsS -m 3 http://127.0.0.1:8001/api/health >/dev/null 2>&1; then
+    echo "ui:         up   http://127.0.0.1:8001"
+  else
+    echo "ui:         down"
+  fi
+  if curl -fsS -m 3 http://127.0.0.1:8003/status >/dev/null 2>&1; then
+    local pid
+    pid="$(cat "$HOME/.qwen/agent_supervisor.pid" 2>/dev/null || echo ?)"
+    echo "supervisor: up   pid=$pid"
+  else
+    echo "supervisor: down"
+  fi
+  if is_serving; then
+    echo "inference:  up   http://$QWEN_HOST:$QWEN_PORT"
+  else
+    echo "inference:  down"
+  fi
+}
+
+main() {
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      /*|~*|./*|../*) cmd_agent "$1"; return ;;
+    esac
+    if [ -d "$1" ]; then cmd_agent "$1"; return; fi
+  fi
+  local cmd="${1:-agent}"
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    chat)             cmd_chat "$@" ;;
+    agent)            cmd_agent "$@" ;;
+    start|serve)      cmd_start "$@" ;;
+    stop)             cmd_stop ;;
+    restart)          cmd_stop; cmd_start -d ;;
+    status)           cmd_status ;;
+    logs)             cmd_logs "$@" ;;
+    bench)            cmd_bench ;;
+    eval)             cmd_eval ;;
+    ui)               cmd_ui "$@" ;;
+    ui-stop)          cmd_ui_stop ;;
+    ui-status)        cmd_ui_status ;;
+    ui-restart)       cmd_ui_restart "$@" ;;
+    -h|--help|help)   usage ;;
+    *) echo "qwen: unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

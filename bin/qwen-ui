@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# qwen-ui — convenience wrapper that's just `qwen ui` so the web UI is
+# launchable as a top-level command from anywhere on PATH.
+#
+# Symlink this into ~/.local/bin (or any PATH dir) the same way `qwen` is.
+# All flags pass through:
+#     qwen-ui                    # default --port 8001
+#     qwen-ui --port 9000        # custom port
+#     qwen-ui status             # → qwen ui-status
+#     qwen-ui stop               # → qwen ui-stop
+
+set -euo pipefail
+
+# Follow the symlink to find the real script dir, so `qwen-ui` symlinked
+# from ~/.local/bin still locates the project's `qwen` next to it.
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+QWEN="$SCRIPT_DIR/qwen"
+
+if [ ! -x "$QWEN" ]; then
+  echo "qwen-ui: cannot find qwen launcher at $QWEN" >&2
+  exit 1
+fi
+
+# Translate the convenience subcommands so `qwen-ui status` and `qwen-ui stop`
+# do what you'd expect.
+case "${1:-}" in
+  status)  shift; exec "$QWEN" ui-status  "$@" ;;
+  stop)    shift; exec "$QWEN" ui-stop    "$@" ;;
+  restart) shift; exec "$QWEN" ui-restart "$@" ;;
+  -h|--help)
+    cat <<EOF
+qwen-ui — start the local Qwen web UI (chat + continuous agents).
+
+Usage:
+  qwen-ui                       Start the UI on http://127.0.0.1:8001
+  qwen-ui --port 9000           Start on a different port
+  qwen-ui restart               Stop any running UI, start fresh
+  qwen-ui status                Show UI / supervisor / inference state
+  qwen-ui stop                  Stop the agent supervisor (UI exits on its own)
+
+The agent supervisor keeps running across UI restarts so saved agents
+keep firing on schedule even after you close the browser.
+EOF
+    exit 0
+    ;;
+esac
+
+exec "$QWEN" ui "$@"

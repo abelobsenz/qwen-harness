@@ -1,0 +1,77 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+venv/
+env/
+.venv/
+.env
+*.env
+
+# --- macOS ---
+.DS_Store
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Models (huge binary weights, fetch separately) ---
+models/
+
+# --- Auto-generated session/run debris ---
+.snapshots/
+.stress_test_log/
+logs/
+bench_results/
+
+# --- Eval state (regenerated on each run; ground-truth answers leak rubric) ---
+eval_data/sessions/
+eval_data/runner_iter*.out
+eval_data/results.jsonl
+eval_data/bds_qwen36/
+eval_data/bds_qwen36_*.log
+eval_data/bds_qwen36_*.pid
+
+# --- Personal notes / iteration narratives (not user-facing docs) ---
+docs/internal/
+docs/finance_eval_loop_state.md
+docs/optimization_audit_*.md
+docs/enchilada_session_results.md
+docs/perf_round_*.md
+docs/easy_wins_round.md
+docs/agent_graph_round*.md
+.claude/
+
+# --- One-off agent outputs / unrelated scripts left in tree ---
+netflix_q4_repurchase_analysis.md
+trade_bot.py
+
+# --- Tooling output ---
+*.log
+*.pid
+htmlcov/
+.coverage
+coverage.xml
+
+# --- Local config overrides (template lives at config/qwen.conf.example) ---
+# qwen.conf is tracked; override locally via env or create qwen.conf.local
+config/qwen.conf.local
+
+# --- Audit / build artifacts ---
+audits/
+.audits/
+*.audit.md
+SWEBENCH_*/
+swebp_*/
