@@ -11,6 +11,7 @@
 #   qwen start -d       Run server detached.
 #   qwen stop           Stop the daemon.
 #   qwen restart        Stop + start daemon.
+#   qwen boot           FROM SCRATCH: kill everything, restart daemon + supervisor + UI.
 #   qwen status         Show running state.
 #   qwen logs [-f]      Tail logs.
 #   qwen bench          Run benchmark suite against the daemon.
@@ -37,7 +38,10 @@ PID_FILE="$LOG_DIR/server.pid"
 CONFIG_FILE="$PROJECT_ROOT/config/qwen.conf"
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  # Print every leading-comment line of this script (lines 2 onward until
+  # the first non-comment line). Keeps Usage in lockstep with the
+  # commented top-of-file documentation.
+  awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
 }
 
 if [ -f "$CONFIG_FILE" ]; then
@@ -455,6 +459,133 @@ cmd_ui_status() {
   fi
 }
 
+# qwen boot — full from-scratch restart.
+# Tears down UI, supervisor, and daemon; then starts daemon (detached),
+# waits for the model to be actually decode-ready (not just /v1/models
+# 200), and starts the UI in the background. Equivalent to running
+# `qwen ui-stop; qwen stop; qwen start -d; wait; qwen ui &` but with
+# kill-9 escalation, a real decode-readiness probe, and a final status
+# print. Use after a crash, a hung worker, or when you want a known-good
+# state.
+cmd_boot() {
+  echo "qwen boot: FROM SCRATCH restart of daemon + supervisor + UI"
+  echo ""
+
+  # ---- Phase 1: tear everything down -------------------------------
+  echo "[1/4] stopping UI processes (scripts/qwen_ui.py)…"
+  local pids
+  pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill -INT $pids 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+      [ -z "$pids" ] && break
+      sleep 1
+    done
+    pids="$(pgrep -f 'scripts/qwen_ui.py' 2>/dev/null || true)"
+    # shellcheck disable=SC2086
+    [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+  fi
+
+  echo "[1/4] stopping agent supervisor…"
+  cmd_ui_stop > /dev/null 2>&1 || true
+
+  echo "[1/4] stopping daemon (dflash + proxy)…"
+  cmd_stop > /dev/null 2>&1 || true
+  sleep 1
+
+  # Sanity sweep: anything still alive from the qwen process family
+  # gets force-killed so phase-2 has a clean port environment. The
+  # pattern uses `dflash` (not `dflash-serve`) because the script that
+  # binds port 8002 is `dflash_serve_patched.py` with an UNDERSCORE —
+  # the upstream binary `dflash-serve` (hyphen) is invoked from there
+  # but doesn't appear in `ps` argv directly. Matching just `dflash`
+  # catches both the patched wrapper and any stray upstream worker.
+  local survivors
+  survivors="$(pgrep -fl 'dflash|qwen_proxy|_qwen_daemon\.py|qwen_ui\.py|qwen_agent_supervisor' 2>/dev/null || true)"
+  if [ -n "$survivors" ]; then
+    echo "[1/4] leftover processes — force-killing:"
+    echo "$survivors" | sed 's/^/         /'
+    pkill -9 -f 'dflash|qwen_proxy|_qwen_daemon\.py|qwen_ui\.py|qwen_agent_supervisor' 2>/dev/null || true
+    sleep 1
+  fi
+
+  # ---- Phase 2: start daemon detached ------------------------------
+  echo ""
+  # NB: braces around ${QWEN_PORT} are required — bash 3.2 (macOS stock)
+  # eagerly consumes the following UTF-8 ellipsis bytes into the variable
+  # name when the brace form isn't used, then errors with `set -u` because
+  # `QWEN_PORT…` is unbound. Newer bash + UTF-8 locales handle this fine,
+  # so the original observation only surfaced on a fresh terminal.
+  echo "[2/4] starting daemon detached on ${QWEN_HOST}:${QWEN_PORT}..."
+  cmd_start -d
+
+  # ---- Phase 3: real decode-readiness probe -----------------------
+  # /v1/models alone is insufficient — dflash answers /v1/models BEFORE
+  # MLX finishes loading weights. We drive a 2-token completion as the
+  # readiness probe, matching what eval_data/run_finance_eval.py's
+  # _hard_restart_server does. Cold load is ~1-3 min on M-class hardware.
+  echo ""
+  echo "[3/4] waiting for model to be decode-ready (cold load: ~1-3 min)…"
+  local deadline=$((SECONDS + 240))
+  local ready=0
+  local model_id="${QWEN_MODEL_NAME:-$QWEN_MODEL_PATH}"
+  printf "   "
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS -m 1 "http://$QWEN_HOST:$QWEN_PORT/v1/models" >/dev/null 2>&1; then
+      local resp
+      resp="$(curl -fsS -m 30 \
+        -X POST "http://$QWEN_HOST:$QWEN_PORT/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}],\"max_tokens\":2,\"stream\":false}" \
+        2>/dev/null)" || true
+      if [ -n "$resp" ] && echo "$resp" | grep -q '"content"'; then
+        ready=1
+        break
+      fi
+    fi
+    printf "."
+    sleep 2
+  done
+  echo ""
+  if [ "$ready" -eq 0 ]; then
+    echo "qwen boot: daemon failed to become decode-ready in 240s." >&2
+    echo "           check \`qwen logs\` and try \`qwen boot\` again." >&2
+    return 1
+  fi
+  echo "   model is decode-ready"
+
+  # ---- Phase 4: UI in background ----------------------------------
+  echo ""
+  echo "[4/4] starting UI in background (port 8001)…"
+  ensure_venv
+  mkdir -p "$LOG_DIR"
+  local ui_log="$LOG_DIR/ui.log"
+  # Self-invoke via the absolute resolved path. cmd_ui auto-spawns the
+  # supervisor via ensure_supervisor. nohup + & + disown for clean
+  # detachment so this process can exit without dragging the UI down.
+  nohup "$SCRIPT_DIR/qwen" ui > "$ui_log" 2>&1 < /dev/null &
+  local ui_pid=$!
+  disown "$ui_pid" 2>/dev/null || true
+
+  # Wait up to 15s for the UI's /api/health to come up.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -fsS -m 1 http://127.0.0.1:8001/api/health >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  # ---- Final status -----------------------------------------------
+  echo ""
+  cmd_ui_status
+  echo ""
+  echo "qwen boot: complete. open http://127.0.0.1:8001"
+  echo "           UI log: $ui_log"
+  echo "           daemon log: $LOG_FILE"
+}
+
 main() {
   if [ $# -gt 0 ]; then
     case "$1" in
@@ -470,6 +601,7 @@ main() {
     start|serve)      cmd_start "$@" ;;
     stop)             cmd_stop ;;
     restart)          cmd_stop; cmd_start -d ;;
+    boot)             cmd_boot ;;
     status)           cmd_status ;;
     logs)             cmd_logs "$@" ;;
     bench)            cmd_bench ;;

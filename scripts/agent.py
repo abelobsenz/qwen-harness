@@ -93,21 +93,50 @@ Do not narrate doubt repeatedly. Repeated self-questioning is a stop signal: cho
 - 3+ sub-steps → `todo_write`.
 
 # Quantitative answers — match the question's metadata exactly
-Before quoting any number, parse the question into (entity, period, metric, units, scope) and match each spec exactly. Mismatches in any one of these dimensions silently produce confidently-wrong answers — applies to filings, prices, returns, macro series, and any other quantitative source.
-- ENTITY: parent vs subsidiary vs segment; ticker vs company; spot vs futures; index vs constituent; one venue's quote vs consolidated tape.
-- PERIOD: align granularity — a quarter needs a quarterly source, intraday needs intraday, calendar year ≠ fiscal year, "year-to-date" ≠ "trailing twelve months". When no period is given, default to the latest *completed* one: the most recent annual report for fundamentals, the prior trading session's close for prices, the latest released print for macro series.
-- METRIC: closely-related quantities are not interchangeable. Examples — "long-term debt" excludes current portion; "operating income" ≠ "net income"; "GAAP" ≠ "non-GAAP"; "diluted EPS" ≠ "basic"; "shares repurchased" ≠ "dollars spent"; "total return" ≠ "price return"; "implied vol" ≠ "realized"; "last trade" ≠ "mid" ≠ "official close".
-- UNITS: read the table/feed header — shares in raw integers vs thousands; dollars vs cents; basis points vs percent; UTC vs local time.
-- SCOPE: consolidated vs segment; pre-tax vs after-tax; gross vs net; cumulative vs period; regular hours vs full session.
+Before quoting any number, parse the question into (entity, period, metric, units, scope) and match each spec exactly. Mismatches in any one of these dimensions silently produce confidently-wrong answers. Applies to any quantitative claim — financial filings, clinical trial endpoints, sports statistics, ML/benchmark scores, macro indicators, engineering specs, scientific measurements.
+- ENTITY: the specific subject of the question, not a related one.
+  - Finance: parent vs subsidiary vs segment; ticker vs company; index vs constituent; spot vs futures.
+  - Clinical: ITT vs per-protocol vs safety population; specific dose arm vs pooled; subgroup vs overall.
+  - Sports: regular season vs playoffs vs career; player vs team; single game vs aggregate.
+  - ML/CS: a specific model checkpoint vs ensemble; benchmark variant (MMLU vs MMLU-Pro); release date vs current.
+  - Macro/stats: country vs region; survey-of-households vs survey-of-firms; nominal vs real.
+- PERIOD: align granularity and base period.
+  - Finance: calendar year ≠ fiscal year; YTD ≠ TTM; a quarter needs a quarterly source; intraday needs intraday.
+  - Clinical: primary endpoint timepoint (week 12 vs week 52); follow-up duration; baseline vs end-of-study.
+  - Sports: season-year vs calendar year; full season vs partial; pre- vs post-break.
+  - ML: at original release vs latest update; at fixed step count vs at convergence.
+  - Macro: seasonally adjusted vs not; constant-dollar base year matters.
+  - When no period is given, default to the latest *completed* one — most recent annual report, latest published trial result, prior session's close, latest released print.
+- METRIC: closely-related quantities are not interchangeable.
+  - Finance: "long-term debt" excludes current portion; "operating income" ≠ "net income"; GAAP ≠ non-GAAP; diluted EPS ≠ basic; "shares repurchased" (count) ≠ "dollars spent"; total return ≠ price return; implied vol ≠ realized; last trade ≠ mid ≠ official close.
+  - Clinical: hazard ratio ≠ odds ratio ≠ relative risk; absolute risk reduction ≠ relative; mean ≠ median; adjusted ≠ unadjusted; per-protocol ≠ ITT.
+  - Sports: per-game ≠ per-36 ≠ per-100 possessions; FG% ≠ effective FG% ≠ true shooting %; PER ≠ BPM ≠ VORP.
+  - ML/CS: top-1 ≠ top-5; macro-F1 ≠ micro-F1; BLEU ≠ ROUGE; pass@1 ≠ pass@10; latency ≠ throughput; p50 ≠ p99.
+  - Macro: headline CPI ≠ core CPI ≠ PCE; unemployment rate ≠ U-6; nominal GDP ≠ real GDP.
+- UNITS: read the label.
+  - Finance: shares as raw integers vs thousands; dollars vs cents; basis points vs percent.
+  - Clinical: mg/dL vs mmol/L; μM vs nM; percentage points vs percent change.
+  - Sports/engineering: yards vs meters; mph vs km/h; MB vs MiB; ms vs μs; FLOPs vs MACs.
+  - Macro: thousands of persons vs millions; index level vs % change.
+- SCOPE: which slice of the population the figure covers.
+  - Finance: consolidated vs segment; pre-tax vs after-tax; gross vs net; cumulative vs period; regular hours vs full session.
+  - Clinical: ITT vs per-protocol; overall vs prespecified subgroup; safety vs efficacy population.
+  - Sports: starts only vs all games; home vs away; specific opponent vs season-long.
+  - ML: single-GPU vs distributed; FP32 vs FP16 vs int8; with vs without CoT prompting.
 A figure that's right by ±1 row or column of the table is still wrong. Re-read the label before quoting.
 
 # Sibling-metric ambiguity — present both interpretations
 When a question term maps to ≥2 plausible candidates and convention disagrees with the literal reading, name the one you used and give the alternative as an aside. Cross-domain examples:
-- Filings: "all debt" includes the current portion (literal) but refinancing-sensitivity analyses conventionally use long-term-only.
-- Market data: "price" can mean last trade, mid (bid+ask)/2, official close, or VWAP — these can differ by 50+ bps in low-liquidity names.
-- Returns: "return" could be total (incl. dividends and corp actions), price-only, log, or simple — picking the wrong one inverts the sign on near-zero moves.
-- Earnings family: "earnings" / "income" / "revenue" / "EPS" each have several variants (operating, net, gross, EBITDA, diluted, basic).
+- Filings: "all debt" includes the current portion (literal) but refinancing-sensitivity work conventionally uses long-term-only.
+- Market data: "price" can mean last trade, mid (bid+ask)/2, official close, or VWAP — can differ 50+ bps in low-liquidity names.
+- Returns: "return" could be total (incl. dividends + corp actions), price-only, log, or simple — picking the wrong one can invert the sign on near-zero moves.
 - Volatility: realized vs implied; annualized vs daily; close-to-close vs intraday range.
+- Clinical effect size: "the drug reduced risk by X%" could be ARR (absolute) or RRR (relative) — they differ 5–10× for low-baseline events; meta-analyses use HR while patient leaflets use ARR.
+- Survival outcomes: "X% survived" → at what timepoint? 1-year, 5-year, median follow-up, end of trial?
+- Sports stats: "20 PPG" usually means regular-season per-game; "PPG in the playoffs" is a separate sample. Shooting percentages: FG%, eFG%, and TS% are all called "shooting %" colloquially but differ by 5–10pp.
+- ML benchmarks: "model X scored Y on benchmark Z" — k-shot vs 0-shot, CoT vs no-CoT, validation vs test split, with vs without tools.
+- Macro: "inflation was X%" — YoY headline CPI vs core CPI vs PCE vs annualized monthly change.
+- Engineering: "throughput of N" — sustained vs peak; under load vs idle; per-device vs aggregate.
 Format: `<label used> = <value>; (alt: <other label> = <other value>)`. Robust to both literal and conventional readings without overcommitting to either.
 
 # Search/fetch hygiene
@@ -737,7 +766,22 @@ def step(messages: list[dict], step_num: int = 0) -> bool:
         ctx_color = DIM
     print(f"{ctx_color}[step {step_num} | ~{tokens // 1000}k tokens ({pct}% of compact threshold)]{RESET}")
     resp = post_chat(messages)
-    msg = resp["choices"][0]["message"]
+    # Guard against `{"choices": []}` and `{}`. Under load — concurrent
+    # request fan-in, asyncio cancellation, GC pause mid-encode — the
+    # upstream can return a structurally-valid JSON envelope with an
+    # empty `choices` list, no message field, or a missing key entirely.
+    # Pre-fix this crashed run_query with `IndexError: list index out of
+    # range` and SIGKILLed the headless session before any tool could
+    # run (observed on prompt 7 of vals_ai_finance v3 bench). Synthesize
+    # an empty assistant turn so the existing empty-turn nudge below
+    # (~line 786) can recover the loop rather than aborting the session.
+    choices = resp.get("choices") if isinstance(resp, dict) else None
+    if not choices:
+        print(f"{YELLOW}[harness: upstream returned empty choices — synthesizing empty turn]{RESET}")
+        msg = {"role": "assistant", "content": ""}
+    else:
+        first = choices[0] if isinstance(choices, list) and choices else {}
+        msg = first.get("message") or {"role": "assistant", "content": ""}
     messages.append(msg)
 
     # Loop-guard surfacing happens early: even responses that DO have

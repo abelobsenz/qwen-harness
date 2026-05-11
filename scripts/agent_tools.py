@@ -30,6 +30,18 @@ GREP_DEFAULT_HEAD = 250          # default cap on grep result lines
 GREP_LINE_MAX_CHARS = 500        # truncate matched lines longer than this
 VCS_EXCLUDES = (".git", ".hg", ".svn", ".bzr", ".jj", ".sl")
 
+# Shared "refused" markers. The system prompt at scripts/agent.py:71-76
+# trains the model that `[REFUSED — ... cap reached]` is a HARD STOP. The
+# cap-exhaustion nudge in scripts/agent.py:1003-1020 detects refusals by
+# matching this exact prefix on tool-result content. Keep both REFUSED_PREFIX
+# (the canonical emit prefix used by every cap site here) and
+# REFUSED_DETECT_PREFIX (the broader stem used by .startswith checks so a
+# future ASCII-dash variant or whitespace tweak doesn't silently slip past
+# detection) in one place so a contributor adding a new refusal point can
+# pattern-match through grep without missing the harness contract.
+REFUSED_PREFIX = "[REFUSED — "
+REFUSED_DETECT_PREFIX = "[REFUSED"
+
 
 # ---------- web ------------------------------------------------------------
 #
@@ -37,28 +49,32 @@ VCS_EXCLUDES = (".git", ".hg", ".svn", ".bzr", ".jj", ".sl")
 #  - web_search:  DuckDuckGo, with semantic + lexical near-duplicate query
 #                 detection so the model isn't rewarded for re-asking the
 #                 same question with a synonym.
-#  - web_fetch:   article-aware HTML extraction with smart truncation that
-#                 keeps the head + tail of a page (where the abstract /
-#                 conclusion live in academic papers) instead of slicing
-#                 the body in half.
+#  - web_fetch:   article-aware HTML extraction. Full stripped body (up to
+#                 3 MB) is fed into `condense_tool_result`, which uses
+#                 BM25 lexical scoring + an ONNX cross-encoder reranker
+#                 to keep the chunks most relevant to the task. Memory
+#                 bound stays tight because the final result returned to
+#                 the model is capped at TOOL_RESULT_MAX (~60 k).
 #  - web_outline: lightweight "what's on this page?" tool that returns just
 #                 the heading hierarchy + a few words of body so the model
 #                 can decide whether a fetch is worthwhile before paying
 #                 the full content-extraction cost.
 
-# Default per-call truncation cap. _smart_truncate keeps head+tail (bias
-# toward the start), DISCARDING THE MIDDLE. That works for academic papers
-# (abstract + conclusion) but fails for long structured docs (SEC 10-Ks,
-# proxy statements, lengthy reports) where the actual data tables and
-# named sections live in the MIDDLE. Bumped 120k → 300k so a typical
-# 240k 10-K passes through smart_truncate intact, then condense_tool_result
-# (which chunk-ranks with table-detection + section-continuity boosts)
-# picks the right content. Final size to the model is still bounded by
-# the agent's TOOL_RESULT_MAX (60k), so memory pressure is unchanged.
-# QWEN_WEB_FETCH_MAX_CALLS is the per-task fetch-call budget; keep the
-# body-size cap under a distinct name so the two knobs cannot silently clobber
-# each other.
-WEB_FETCH_DEFAULT_MAX = int(os.environ.get("QWEN_WEB_FETCH_MAX_CHARS", "300000"))
+# Default per-call truncation cap. Iter 39: bumped 300 k → 3 M to keep the
+# entire stripped body of any reasonable filing/paper/doc intact through
+# `_smart_truncate`, since `condense_tool_result` now uses BM25 + an ONNX
+# cross-encoder reranker (Xenova/ms-marco-MiniLM-L-6-v2, 22 MB int8) to
+# pick the relevant chunks from the full body. The old 300 k cap forced
+# `_smart_truncate` to keep head 55% + tail 45% and drop the middle —
+# exactly where SEC 10-K financial-statement notes (debt schedules,
+# convertible-notes tables, segment data) live, so the reranker was being
+# fed the wrong document slice. Memory bound stays tight: 3 MB of stripped
+# text is well within Python's comfort zone, BM25 over ~2 k chunks
+# completes in <30 ms, the reranker scores only the top-32 BM25 hits
+# (~50 ms), and `condense_tool_result` caps the final output to the
+# agent's TOOL_RESULT_MAX (~60 k). `_smart_truncate` remains as a safety
+# net for pages above this ceiling but should rarely fire in practice.
+WEB_FETCH_DEFAULT_MAX = int(os.environ.get("QWEN_WEB_FETCH_MAX_CHARS", "3000000"))
 WEB_FETCH_HEAD_FRACTION = 0.55  # bias toward the start (titles / abstracts)
 
 
@@ -529,7 +545,8 @@ def _smart_truncate(text: str, max_chars: int) -> str:
 
 
 def web_fetch(url: str, max_chars: int = WEB_FETCH_DEFAULT_MAX,
-              force_browser: bool = False, head_only: bool = False) -> str:
+              force_browser: bool = False, head_only: bool = False,
+              mode: str = "semantic") -> str:
     """Fetch a URL and return its readable text.
 
     Pipeline:
@@ -538,10 +555,22 @@ def web_fetch(url: str, max_chars: int = WEB_FETCH_DEFAULT_MAX,
       2. Fall back to a JS-rendering Chromium browser via crawl4ai for
          pages where the static path can't recover content (≈ SPAs).
 
+    `mode` selects the retrieval profile that `condense_tool_result` will
+    apply downstream:
+      - "numerical": answer is stated verbatim (specific value, count,
+        name, date, or list item). Lexical + structural ranking only —
+        cross-encoder is bypassed because it demotes numeric/tabular
+        chunks in favor of prose that merely describes them.
+      - "semantic" (default): answer is a synthesis/judgment built from
+        prose. Engages the cross-encoder + sentence-extract pipeline so
+        the kept chunks are the ones that actually answer the question,
+        not just mention the topic.
+
     Truncation keeps both ends of the body so abstract + conclusion both
     survive on long pages. Set `head_only=True` to skip the tail and only
     keep the start — useful when you only want a heading-and-abstract.
     """
+    _set_fetch_mode(mode)
     if not force_browser:
         text = _static_fetch(url, max_chars, head_only=head_only)
         if text is not None:
@@ -682,17 +711,32 @@ def _static_fetch(url: str, max_chars: int, head_only: bool = False) -> str | No
     extracted: str | None = None
     page_title = ""
 
+    # Pre-strip XBRL inline tags (iXBRL — `<ix:nonFraction>`, `<ix:nonNumeric>`,
+    # `<ix:continuation>`, etc.). These wrap numeric values in SEC filings;
+    # downstream parsers (trafilatura, BS4) treat them as foreign-namespace
+    # elements and drop their text content along with the tags, which silently
+    # eats the values in financial-statement tables (Snap 10-K convertible-
+    # notes-if-converted, dilutive share counts, revenue line items, etc.).
+    # Strip just the opening/closing tags, preserve the inner text — this is
+    # the same content that human readers see in the document. Regex is bounded
+    # to the `ix:` namespace so non-XBRL namespaces (svg:, math:) are unaffected.
+    raw_html = r.text
+    if "<ix:" in raw_html:
+        raw_html = re.sub(r"</?ix:[a-zA-Z0-9_]+(?:\s[^>]*)?>", "", raw_html)
+
     # Try trafilatura first — much better at separating content from chrome.
     try:
         import trafilatura
-        # favor_recall=True keeps borderline paragraphs (less aggressive
-        # pruning); we'd rather have a slightly-noisy result than miss the
-        # actual content. include_comments=False since we're never asking
-        # the model to grade comment threads.
+        # NOTE: dropped favor_recall=True after diagnosing the Snap 10-K
+        # table-cell-value loss bug. With favor_recall=True, trafilatura
+        # was aggressively merging/deduping short numeric paragraphs and
+        # losing the actual numbers in financial-statement tables — the
+        # opposite of what the flag's name suggests. Default (precision-
+        # oriented) extraction keeps the cell values intact.
+        # include_comments=False since we're never grading comment threads.
         tx = trafilatura.extract(
-            r.text,
+            raw_html,
             output_format="markdown",
-            favor_recall=True,
             include_comments=False,
             include_tables=True,
             with_metadata=False,
@@ -702,7 +746,7 @@ def _static_fetch(url: str, max_chars: int, head_only: bool = False) -> str | No
         # Fish out the title separately — trafilatura.extract drops it
         # in markdown mode; metadata gives us a clean version.
         try:
-            md = trafilatura.extract_metadata(r.text)
+            md = trafilatura.extract_metadata(raw_html)
             if md and getattr(md, "title", None):
                 page_title = md.title.strip()
         except Exception:  # noqa: BLE001
@@ -717,7 +761,8 @@ def _static_fetch(url: str, max_chars: int, head_only: bool = False) -> str | No
     if extracted is None:
         try:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "html.parser")
+            # Use the ix-stripped html so XBRL inline values survive here too.
+            soup = BeautifulSoup(raw_html, "html.parser")
         except Exception:  # noqa: BLE001
             return None
 
@@ -1044,6 +1089,51 @@ def web_outline(url: str, max_headings: int = 80) -> str:
 
 # ---------- files ----------------------------------------------------------
 
+def _too_broad_scope_refusal(resolved: Path, tool_name: str) -> str | None:
+    """Refuse recursive walks that would scan the home dir, the filesystem
+    root, or system dirs holding credentials / app state. The list is
+    intentionally tight — `$HOME/Documents`, `$HOME/Desktop`, `~/code`,
+    and other legitimate working folders are NOT refused. We only block:
+
+      - the actual root / parent-of-users dirs (`/`, `/Users`, `/home`)
+      - the home dir itself (greppable subdirs are fine, the root is not)
+      - macOS / Unix system roots (`/System`, `/Library`, `/etc`, `/var`,
+        `/usr`, `/opt`, `/Applications`, `/Volumes`, `/private`, `/bin`,
+        `/sbin`)
+      - credential / app-state dirs inside `$HOME` (`.ssh`, `.gnupg`,
+        `.aws`, `.kube`, `.config`, `Library`)
+
+    Single-file targets are always allowed — only directory walks fire."""
+    try:
+        if not resolved.is_dir():
+            return None
+    except OSError:
+        return None
+    p = str(resolved).rstrip("/") or "/"
+    home = str(Path.home()).rstrip("/")
+    # macOS resolves /etc, /var, /tmp through /private. The resolved forms
+    # are included explicitly so the exact-match check still fires; /tmp
+    # itself (resolves to /private/tmp) is deliberately NOT blocked
+    # because it's the scratch working dir.
+    blocked = {
+        "/", home, "/Users", "/home",
+        "/Library", "/System", "/private",
+        "/etc", "/var", "/usr", "/opt",
+        "/Applications", "/Volumes", "/bin", "/sbin",
+        "/private/etc", "/private/var",  # macOS-resolved siblings
+        f"{home}/Library", f"{home}/.ssh", f"{home}/.gnupg",
+        f"{home}/.aws", f"{home}/.kube", f"{home}/.config",
+    }
+    if p in blocked:
+        return (
+            f"[refused] {tool_name} scope '{resolved}' is too broad — that "
+            f"path holds ssh keys, browser data, app state, or personal "
+            f"documents. Pass a specific subdirectory (e.g. the active "
+            f"project root) or a single file path instead."
+        )
+    return None
+
+
 def read_file(path: str, offset: int = 0, limit: int = READ_DEFAULT_LINES) -> str:
     """Read a slice of a file. offset is 0-based; limit caps lines returned."""
     p = Path(path).expanduser().resolve()
@@ -1072,6 +1162,9 @@ def list_files(path: str = ".", pattern: str = "**/*", max_results: int = 100) -
     base = Path(path).expanduser().resolve()
     if not base.exists():
         return f"[error] no such path: {base}"
+    refusal = _too_broad_scope_refusal(base, "list_files")
+    if refusal:
+        return refusal
     matches = []
     for m in base.glob(pattern):
         if m.is_file():
@@ -1104,6 +1197,9 @@ def grep(
     base = Path(path).expanduser().resolve()
     if not base.exists():
         return f"[error] no such path: {base}"
+    refusal = _too_broad_scope_refusal(base, "grep")
+    if refusal:
+        return refusal
     use_rg = shutil.which("rg") is not None
 
     if use_rg:
@@ -1379,18 +1475,262 @@ _CONDENSE_TOOLS = frozenset({
 })
 
 
-def _tokenize_relevance(text: str) -> set[str]:
-    stop = {
-        "about", "after", "again", "also", "because", "before", "between",
-        "could", "from", "have", "into", "more", "must", "need", "only",
-        "over", "should", "than", "that", "their", "there", "these",
-        "this", "those", "through", "using", "what", "when", "where",
-        "which", "while", "with", "would", "your",
-    }
-    return {
+# Fetch mode plumbing. The model picks a mode in its tool call
+# (`web_fetch(..., mode="numerical"|"semantic")`); web_fetch sets a
+# module-level variable; condense_tool_result reads it and applies the
+# corresponding retrieval profile. Default is "semantic" — the safe
+# choice for prose-derived answers. Models pick "numerical" when the
+# answer is stated verbatim in the source (a value, count, name, date,
+# or list item) — bypassing the cross-encoder which can demote tabular /
+# numeric chunks in favor of prose that merely describes them.
+_DEFAULT_FETCH_MODE = "semantic"
+_LAST_FETCH_MODE: str = _DEFAULT_FETCH_MODE
+
+_MODE_PROFILES: dict[str, dict] = {
+    # Verbatim lookup: lexical + structural only. Tables and numeric
+    # content survive intact at top_k=10. CE rerank and sentence-extract
+    # are bypassed.
+    "numerical": {
+        "top_k": 10,
+        "continuity": 2,
+        "use_rerank": False,
+        "use_sentence_extract": False,
+    },
+    # Synthesis from prose: BM25 picks the candidate pool, cross-encoder
+    # picks the answer-bearing passages within it, and sentence-extract
+    # tightens prose chunks.
+    "semantic": {
+        "top_k": 10,
+        "continuity": 2,
+        "use_rerank": True,
+        "use_sentence_extract": True,
+    },
+}
+
+
+def _set_fetch_mode(mode: str | None) -> None:
+    global _LAST_FETCH_MODE
+    if mode in _MODE_PROFILES:
+        _LAST_FETCH_MODE = mode
+    else:
+        _LAST_FETCH_MODE = _DEFAULT_FETCH_MODE
+
+
+def _get_fetch_mode_profile() -> dict:
+    return _MODE_PROFILES.get(_LAST_FETCH_MODE, _MODE_PROFILES[_DEFAULT_FETCH_MODE])
+
+
+_RELEVANCE_STOP = frozenset({
+    "about", "after", "again", "also", "because", "before", "between",
+    "could", "from", "have", "into", "more", "must", "need", "only",
+    "over", "should", "than", "that", "their", "there", "these",
+    "this", "those", "through", "using", "what", "when", "where",
+    "which", "while", "with", "would", "your",
+})
+
+
+def _tokenize_relevance_list(text: str) -> list[str]:
+    """Tokenize preserving term frequency. BM25 needs the list (TF matters)
+    even though the older set-based scorer didn't."""
+    return [
         w for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]{2,}", text.lower())
-        if w not in stop
-    }
+        if w not in _RELEVANCE_STOP
+    ]
+
+
+def _tokenize_relevance(text: str) -> set[str]:
+    return set(_tokenize_relevance_list(text))
+
+
+# Hybrid retrieval state (BM25 lexical + cross-encoder semantic rerank).
+# Both stages are lazy: rank_bm25 imports happen on first condense call that
+# clears min_chars; the ONNX cross-encoder loads on first call where
+# QWEN_CONDENSE_RERANK is enabled. Loading is guarded by a lock so concurrent
+# tool dispatches don't race on the HF snapshot_download.
+_RERANK_LOCK = threading.Lock()
+_RERANK_SESSION = None
+_RERANK_TOKENIZER = None
+_RERANK_LOAD_FAILED = False
+
+
+def _rerank_model_id() -> str:
+    return os.environ.get(
+        "QWEN_RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2",
+    )
+
+
+def _rerank_load() -> bool:
+    """Lazy-load the ONNX cross-encoder. Returns True if ready, False on any
+    failure (network down, model missing, onnxruntime not installed). Failure
+    is sticky for the process so we don't retry the download on every fetch."""
+    global _RERANK_SESSION, _RERANK_TOKENIZER, _RERANK_LOAD_FAILED
+    if _RERANK_SESSION is not None:
+        return True
+    if _RERANK_LOAD_FAILED:
+        return False
+    with _RERANK_LOCK:
+        if _RERANK_SESSION is not None:
+            return True
+        if _RERANK_LOAD_FAILED:
+            return False
+        try:
+            from huggingface_hub import snapshot_download
+            from transformers import AutoTokenizer
+            import onnxruntime as ort  # noqa: WPS433
+            local = snapshot_download(
+                _rerank_model_id(),
+                allow_patterns=[
+                    "tokenizer*", "vocab.txt", "special_tokens_map.json",
+                    "config.json", "onnx/model_quantized.onnx",
+                ],
+            )
+            tok = AutoTokenizer.from_pretrained(local)
+            # CPU EP is the right pick: 22M-param MiniLM on Apple Silicon is
+            # ~1.4ms/pair on CPU; CoreML EP adds ~200ms warmup and contends
+            # with dflash-serve on the ANE for nothing.
+            sess = ort.InferenceSession(
+                f"{local}/onnx/model_quantized.onnx",
+                providers=["CPUExecutionProvider"],
+            )
+            _RERANK_TOKENIZER = tok
+            _RERANK_SESSION = sess
+            return True
+        except Exception:  # noqa: BLE001
+            _RERANK_LOAD_FAILED = True
+            return False
+
+
+def _cross_encoder_rerank(query: str, chunks: list[str]) -> list[float] | None:
+    """Score (query, chunk) pairs with the local cross-encoder. Returns a
+    list of floats parallel to `chunks`, or None if the reranker isn't
+    available (lets caller fall back to BM25-only ranking).
+
+    Implementation: each chunk gets scored at BOTH its head and tail and
+    we keep the MAX score. The cross-encoder has a hard 512-token cap, so
+    a chunk where the answer-bearing value sits at the END (common pattern
+    in SEC tables — preamble + header rows precede the row that has the
+    actual number) would otherwise score low because the CE only saw the
+    irrelevant preamble. Snap 10-K example: the "Convertible Notes
+    (if-converted)" value (85,945) lives at char 1344 of a 1391-char
+    chunk; the chunk's head is "Net loss" income-statement rows that
+    don't match the dilution query. Scoring head+tail catches it."""
+    if not _rerank_load():
+        return None
+    try:
+        import numpy as np  # noqa: WPS433
+    except Exception:  # noqa: BLE001
+        return None
+    # Cap fed to the cross-encoder per window: ~1.0 KB is comfortably
+    # inside the 512-token cap even for dense numeric text (each digit,
+    # $, comma, newline gets its own token, so 1000 chars ≈ 300-450
+    # tokens).
+    WINDOW = 1000
+
+    def _score(c_list: list[str]) -> list[float] | None:
+        try:
+            enc = _RERANK_TOKENIZER(
+                [query] * len(c_list), c_list,
+                padding=True, truncation=True, max_length=512, return_tensors="np",
+            )
+            feed = {k: v.astype(np.int64) for k, v in enc.items()}
+            out = _RERANK_SESSION.run(None, feed)
+            arr = out[0]
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr.squeeze(-1)
+            return arr.astype(float).tolist()
+        except Exception:  # noqa: BLE001
+            return None
+
+    # Always score the head; for chunks long enough that the tail window
+    # is different content, score the tail too and keep max. "Long enough"
+    # = chunk longer than the head window (otherwise tail == head verbatim
+    # and we'd just be paying for the same score twice).
+    head_scores = _score([c[:WINDOW] for c in chunks])
+    if head_scores is None:
+        return None
+    long_idx = [i for i, c in enumerate(chunks) if len(c) > WINDOW]
+    if long_idx:
+        tail_pairs = [chunks[i][-WINDOW:] for i in long_idx]
+        tail_scores = _score(tail_pairs)
+        if tail_scores is None:
+            return head_scores  # graceful degrade
+        merged = list(head_scores)
+        for j, i in enumerate(long_idx):
+            merged[i] = max(merged[i], tail_scores[j])
+        return merged
+    return head_scores
+
+
+def _bm25_scores(query_tokens: list[str], chunk_tokens: list[list[str]]) -> list[float] | None:
+    """BM25Okapi scores for chunks against query. Returns None if rank_bm25
+    is unavailable so the caller can fall back to set-intersection scoring."""
+    if not query_tokens or not any(chunk_tokens):
+        return None
+    try:
+        from rank_bm25 import BM25Okapi  # noqa: WPS433
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        bm25 = BM25Okapi(chunk_tokens)
+        return list(bm25.get_scores(query_tokens))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Sentence splitter for the optional second-pass cross-encoder. We need to be
+# conservative around finance prose where periods appear in numbers ($10.50),
+# abbreviations (Inc., Corp., Mr.), and section labels (Item 7.). The regex
+# matches period/!/? followed by whitespace and an uppercase / quote /
+# bracket / digit / dollar — a reasonable approximation of a sentence start
+# that avoids splitting "$10.50" or "Item 7. Financial Statements" in the
+# middle. The post-split merge keeps very short fragments attached to the
+# preceding sentence so trailing parenthetical clauses don't get fragmented.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\"'\[#$\d])")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split prose text into sentence-like chunks. Tuned to finance/SEC
+    text where periods are heavily used inside numbers and abbreviations."""
+    if not text:
+        return []
+    parts = _SENT_SPLIT_RE.split(text.strip())
+    out: list[str] = []
+    buf = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        buf = p if not buf else f"{buf} {p}"
+        # Don't emit micro-fragments — headers like "Item 7." are kept
+        # attached to the following sentence instead of becoming a one-
+        # word chunk that scores poorly on its own.
+        if len(buf) >= 40:
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _extract_top_sentences(query: str, chunk_text: str, top_n: int) -> str:
+    """Run the cross-encoder over sentences within a chunk; return the top
+    `top_n` sentences joined in original order. Falls back to the full
+    chunk text if scoring fails or the chunk has too few sentences to
+    benefit from filtering. Skips chunks that look like tables — they
+    need cross-row context that sentence splitting would destroy."""
+    if _looks_like_table(chunk_text):
+        return chunk_text
+    sentences = _split_sentences(chunk_text)
+    if len(sentences) <= top_n:
+        return chunk_text
+    scores = _cross_encoder_rerank(query, sentences)
+    if scores is None:
+        return chunk_text
+    # Pick the top_n by score (highest first), then re-sort by original
+    # position so the output reads in the same order as the source.
+    ranked = sorted(range(len(sentences)), key=lambda i: -scores[i])[:top_n]
+    keep_set = set(ranked)
+    return " ".join(sentences[i] for i in range(len(sentences)) if i in keep_set)
 
 
 def _result_chunks(text: str, target_chars: int) -> list[str]:
@@ -1455,20 +1795,29 @@ def _looks_like_header(chunk: str) -> bool:
     return bool(_SECTION_HEADER_RE.search(head))
 
 
-def _chunk_score(task_terms: set[str], chunk: str, idx: int) -> float:
-    words = _tokenize_relevance(chunk)
-    overlap = len(task_terms & words)
-    score = float(overlap)
+def _structural_boost(chunk: str, idx: int) -> float:
+    """Structural signals that complement lexical scoring: section headers
+    score well on keyword overlap but their data lives in following chunks
+    (handled by continuity), tables encode the actual numbers the user
+    asks about but lose to bag-of-words because cells are mostly digits,
+    and the lead chunk is the page's topical preamble."""
+    score = 0.0
     if _looks_like_header(chunk):
         score += 1.5
-    # Tables carry the actual data the user asks about (numeric breakdowns,
-    # period-by-period rows). Keyword overlap underweights them because
-    # cells are mostly numbers; boost them so the ranker doesn't drop them.
     if _looks_like_table(chunk):
         score += 2.0
     if idx == 0:
         score += 1.0
     return score
+
+
+def _chunk_score(task_terms: set[str], chunk: str, idx: int) -> float:
+    """Legacy set-intersection scorer. Kept as a fallback path for when
+    rank_bm25 is unavailable (and used by the existing test which exercises
+    it directly via condense_tool_result's fallback)."""
+    words = _tokenize_relevance(chunk)
+    overlap = len(task_terms & words)
+    return float(overlap) + _structural_boost(chunk, idx)
 
 
 def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, dict]:
@@ -1500,21 +1849,100 @@ def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, d
     if not task_terms:
         return result, info
     chunk_chars = int(os.environ.get("QWEN_CONDENSE_CHUNK_CHARS", "1400"))
-    top_k = max(1, int(os.environ.get("QWEN_CONDENSE_TOP_K", "5")))
-    lead_chars = int(os.environ.get("QWEN_CONDENSE_LEAD_CHARS", "1200"))
+    # Iter 43: retrieval profile is selected by the fetch mode that
+    # web_fetch (or pdf_extract/arxiv_fetch) recorded for this call. The
+    # model decides per tool call: "numerical" when the answer is stated
+    # verbatim in the source (lexical+structural ranking, CE bypassed),
+    # "semantic" when the answer is synthesized from prose (BM25 + CE +
+    # sentence-extract). Env vars still override for A/B / debug.
+    profile = _get_fetch_mode_profile()
+    top_k = max(1, int(os.environ.get("QWEN_CONDENSE_TOP_K", str(profile["top_k"]))))
+    # Iter 38: lead 1200 → 1800. The first chunk is the page intro
+    # (title, abstract, first paragraph) — for SEC 10-Ks and earnings
+    # press releases the high-level period / entity context lives there.
+    # Cutting it at 1200 chars sometimes truncated mid-sentence in
+    # critical preambles.
+    lead_chars = int(os.environ.get("QWEN_CONDENSE_LEAD_CHARS", "1800"))
     chunks = _result_chunks(result, max(500, chunk_chars))
-    # Note: tested scaling top_k by chunk count (iter 18) — kept more of
-    # long docs but did NOT improve PASS rate on the 3 remaining
-    # extraction-failure prompts (3 cases observed in eval) because those
-    # failures are reasoning-bound, not retrieval-bound. Larger condensed
-    # output also slowed downstream turns. Reverted to fixed top_k.
-    scored = [
-        (_chunk_score(task_terms, chunk, i), i, chunk)
-        for i, chunk in enumerate(chunks)
-    ]
+    # Iter 39: hybrid retrieval. BM25 (rank_bm25) replaces the old set-
+    # intersection scorer for first-pass lexical relevance, and an ONNX
+    # cross-encoder (Xenova/ms-marco-MiniLM-L-6-v2, 22 MB int8) re-scores
+    # the top candidates from BM25 when QWEN_CONDENSE_RERANK=1. The
+    # cross-encoder distinguishes "topic mentioned" from "answer present"
+    # — the gap BM25 alone can't close (e.g. "ARPU is a key metric…"
+    # vs "ARPU was $11.50"). Both stages degrade gracefully: BM25
+    # falls back to set-intersection if rank_bm25 import fails, and
+    # rerank silently skips if the ONNX model can't load.
+    query_tokens = _tokenize_relevance_list(task)
+    chunk_tokens = [_tokenize_relevance_list(c) for c in chunks]
+    bm25 = _bm25_scores(query_tokens, chunk_tokens)
+    if bm25 is None:
+        # Fallback: legacy set-intersection scorer (test-mode + safety net).
+        scored = [
+            (_chunk_score(task_terms, chunk, i), i, chunk)
+            for i, chunk in enumerate(chunks)
+        ]
+    else:
+        scored = [
+            (bm25[i] + _structural_boost(chunk, i), i, chunk)
+            for i, chunk in enumerate(chunks)
+        ]
+    # Snapshot the per-chunk-INDEX score BEFORE any rerank pool
+    # replacement. The continuity-span logic and the lead-chunk auto-keep
+    # both look up scores by chunk index, but post-rerank `scored` gets
+    # replaced with the pool (keyed by position-in-pool, not chunk
+    # index). Indexing `scored[j]` for chunks outside the pool then
+    # fires IndexError on long docs.
+    score_by_idx: dict[int, float] = {i: s for s, i, _ in scored}
+    if bm25 is not None:
+        # Optional second stage: cross-encoder rerank. Only re-rank the
+        # top candidates from BM25 (4x top_k by default) — the
+        # cross-encoder is ~1.4ms/pair so 32 pairs ≈ 50 ms, cheap during
+        # tool dispatch when the proxy is idle. Gated by the fetch-mode
+        # profile (numerical → off, semantic → on), with env override.
+        rerank_default = "1" if profile["use_rerank"] else "0"
+        if os.environ.get("QWEN_CONDENSE_RERANK", rerank_default) in ("1", "true", "True"):
+            rerank_pool = max(top_k * 4, int(os.environ.get("QWEN_CONDENSE_RERANK_POOL", "32")))
+            top_idxs = [
+                idx for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1]))[:rerank_pool]
+            ]
+            top_chunks = [chunks[i] for i in top_idxs]
+            ce = _cross_encoder_rerank(task, top_chunks)
+            if ce is not None:
+                # Iter 41: the kept set must come from the rerank pool. Earlier
+                # we rescaled CE scores into the BM25 range and then re-ran the
+                # top-K selection across all chunks — but with raw CE values
+                # often -10..+5 vs BM25 8..16, rescaling could push CE
+                # candidates *below* non-reranked BM25 chunks and lose the
+                # actual answer-bearing chunk to its neighbors. Snap 10-K
+                # caught this: target chunk at CE rank 4 lost to chunks at
+                # hybrid rank 6-10 that weren't in the rerank pool.
+                #
+                # New behavior: the BM25 stage selects the pool of
+                # candidates that "could plausibly be relevant." The CE
+                # stage picks the top_k *within* that pool. Non-pool
+                # chunks are out of contention (except for the auto-kept
+                # lead chunk handled separately below). Structural boosts
+                # still tip ties between candidates.
+                pool_with_scores = [
+                    (ce[j] + _structural_boost(chunks[top_idxs[j]], top_idxs[j]),
+                     top_idxs[j],
+                     chunks[top_idxs[j]])
+                    for j in range(len(top_idxs))
+                ]
+                # Replace `scored` so the downstream top_k loop picks
+                # from the rerank pool only. Non-pool chunks are gone
+                # from contention (the lead chunk index 0 is auto-kept
+                # below regardless of whether it survived rerank).
+                scored = pool_with_scores
+                info["rerank_used"] = True
+                info["rerank_pool"] = len(top_idxs)
     keep: dict[int, tuple[float, str]] = {}
     if chunks:
-        keep[0] = (scored[0][0], chunks[0][:lead_chars])
+        # Lead chunk auto-kept. Use its own pre-rerank score (not
+        # scored[0] which after rerank-pool replacement is the
+        # highest-scoring pool entry, not the lead chunk).
+        keep[0] = (score_by_idx.get(0, 0.0), chunks[0][:lead_chars])
     for score, i, chunk in sorted(scored, key=lambda x: (-x[0], x[1]))[:top_k]:
         keep[i] = (score, chunk[:chunk_chars])
     # Section-continuity: when we kept a header-like chunk, also keep the
@@ -1523,7 +1951,15 @@ def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, d
     # lives in the following chunks which score poorly individually. Without
     # this, we keep "Item 5. Issuer Purchases of Equity Securities" but drop
     # the table that immediately follows.
-    continuity_span = max(0, int(os.environ.get("QWEN_CONDENSE_HEADER_CONTINUITY", "2")))
+    # Iter 39: pulled back 3 → 1 alongside the top_k trim. Continuity
+    # exists for the case where a section header scores well on keyword
+    # overlap but the data lives in the chunks immediately after. With
+    # BM25 + rerank now scoring the body chunks correctly on their own
+    # merit (TF-IDF doesn't tie header and follow-on chunks the way set-
+    # intersection did), 1 trailing chunk is enough to bridge a table
+    # split across a chunk boundary; more just dilutes the kept set with
+    # near-context the model doesn't need.
+    continuity_span = max(0, int(os.environ.get("QWEN_CONDENSE_HEADER_CONTINUITY", str(profile["continuity"]))))
     if continuity_span > 0:
         for i in list(keep.keys()):
             chunk_text = chunks[i] if i < len(chunks) else ""
@@ -1531,13 +1967,24 @@ def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, d
                 continue
             for j in range(i + 1, min(i + 1 + continuity_span, len(chunks))):
                 if j not in keep:
-                    keep[j] = (scored[j][0], chunks[j][:chunk_chars])
+                    keep[j] = (score_by_idx.get(j, 0.0), chunks[j][:chunk_chars])
     ordered = sorted(keep.items())
     # Concrete recovery hint: the previous "narrower query / higher max_chars"
     # text was misleading — web_fetch has no `query` arg, and the model would
     # waste turns trying to find one. Point at args that actually exist
     # (`max_chars`, `head_only=False`) plus the structural escape hatch
     # (web_outline → fetch the right sub-URL).
+    # Iter 40: optional sentence-level second pass. After BM25 + cross-
+    # encoder pick the top chunks, score sentences WITHIN each prose
+    # chunk and keep only the top N. Cuts the bytes the model has to
+    # decode (typically 3-5× on prose-heavy chunks) while preserving the
+    # exact answer-bearing line. Skips tables (handled by
+    # `_looks_like_table` — they need cross-row context). Off by default
+    # so it can be A/B'd against the baseline; enable with
+    # QWEN_CONDENSE_SENTENCE_EXTRACT=1.
+    sent_extract_default = "1" if profile["use_sentence_extract"] else "0"
+    sent_extract = os.environ.get("QWEN_CONDENSE_SENTENCE_EXTRACT", sent_extract_default) in ("1", "true", "True")
+    sent_top_n = max(1, int(os.environ.get("QWEN_CONDENSE_SENTENCE_TOP_N", "3")))
     out: list[str] = [
         f"[condensed {tool_name}: kept {len(ordered)}/{len(chunks)} chunks, "
         f"{len(result)}→{{PENDING_LEN}} chars. If the section you need was "
@@ -1547,8 +1994,15 @@ def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, d
         f"page (e.g. an exhibit, appendix, or section anchor URL). Do not "
         f"pass a `query` arg — web_fetch has none.]"
     ]
+    n_sent_extracted = 0
     for i, (score, chunk) in ordered:
-        out.append(f"\n--- chunk {i + 1}/{len(chunks)} score={score:.1f} ---\n{chunk.strip()}")
+        body = chunk.strip()
+        if sent_extract and i != 0:  # never sentence-extract the lead chunk
+            extracted = _extract_top_sentences(task, body, sent_top_n)
+            if len(extracted) < len(body):
+                n_sent_extracted += 1
+                body = extracted
+        out.append(f"\n--- chunk {i + 1}/{len(chunks)} score={score:.1f} ---\n{body}")
     condensed = "\n".join(out)
     condensed = condensed.replace("{PENDING_LEN}", str(len(condensed)))
     # If condensing somehow fails to save at least 25%, fail open.
@@ -1559,6 +2013,7 @@ def condense_tool_result(task: str, tool_name: str, result: str) -> tuple[str, d
         "chars_out": len(condensed),
         "chunks_in": len(chunks),
         "chunks_kept": len(ordered),
+        "mode": _LAST_FETCH_MODE,
     })
     return condensed, info
 
@@ -4429,7 +4884,47 @@ _DEFAULT_PREAPPROVED_HOSTS = frozenset({
     "finance.yahoo.com", "www.marketwatch.com",
     "www.federalreserve.gov", "fred.stlouisfed.org",
     "www.bls.gov", "www.bea.gov",
+    # Iter 37 (loosen-for-finance): major business news + data aggregators.
+    # Most of these are paywalled, but the URL guard's purpose is to catch
+    # fabricated slugs — not gate access. A 403/paywall return is fine; the
+    # model marks the URL dead and pivots. Without these in the allowlist,
+    # the model can't even attempt the fetch from a search result it just
+    # got back, because the URL guard fires before _check_url_seen does.
+    "www.cnbc.com", "cnbc.com",
+    "www.reuters.com", "reuters.com",
+    "www.bloomberg.com", "bloomberg.com",
+    "www.ft.com", "ft.com",
+    "www.wsj.com", "wsj.com",
+    "www.barrons.com", "barrons.com",
+    "fortune.com", "www.fortune.com",
+    "www.forbes.com", "forbes.com",
+    "seekingalpha.com", "www.seekingalpha.com",
+    "www.macrotrends.net", "macrotrends.net",
+    "stockanalysis.com", "www.stockanalysis.com",
+    "simplywall.st", "www.simplywall.st",
+    "www.nasdaq.com", "nasdaq.com",
+    "www.nyse.com", "nyse.com",
+    "finance.google.com", "www.google.com/finance",
+    "investor.gov", "www.investor.gov",
+    "sec.report", "www.sec.report",
+    "www.treasury.gov", "treasury.gov",
+    "www.imf.org", "imf.org", "www.worldbank.org", "worldbank.org",
+    "www.oecd.org", "oecd.org",
+    "www.morningstar.com", "morningstar.com",
+    "tradingview.com", "www.tradingview.com",
 })
+
+# Subdomain prefixes that nearly always point to a company's own
+# investor-relations / corporate-affairs surface. A URL like
+# `ir.netflix.com/financial-info/quarterly-results` is essentially as
+# trustworthy as a sec.gov fetch: the host is the company itself,
+# the path is structured. Without this prefix-match the model would
+# need to find the IR URL via a search first, even when the structure
+# is canonical.
+_IR_SUBDOMAIN_PREFIXES = (
+    "ir.", "investor.", "investors.", "investorrelations.",
+    "investor-relations.", "investorrelations-", "corp.", "corporate.",
+)
 
 
 def _normalize_url(url: str) -> str:
@@ -4619,7 +5114,7 @@ class CachedDispatcher:
         # written. The new text orders the exact next two tool calls.
         if self._web_search_near_dup_count >= self._web_search_near_dup_max:
             return (
-                f"[REFUSED — {self._web_search_near_dup_count} near-duplicate "
+                f"{REFUSED_PREFIX}{self._web_search_near_dup_count} near-duplicate "
                 "web_search reformulations. Reformulating further yields "
                 "the same results. Your VERY NEXT actions MUST be: "
                 "(1) `write_file` an artifact summarizing what you found "
@@ -4633,7 +5128,7 @@ class CachedDispatcher:
         # repeated refusals low, and the harness counter triggers an
         # immediate synthesize-now nudge after a single all-refused turn.
         return (
-            f"[REFUSED — web_search cap of {self._web_search_max} reached. "
+            f"{REFUSED_PREFIX}web_search cap of {self._web_search_max} reached. "
             "STOP searching. Synthesize from results already gathered + "
             "call done(). Do NOT issue more web_search calls.]"
         )
@@ -4671,7 +5166,7 @@ class CachedDispatcher:
         if norm not in self._url_fetch_count:
             return None
         return (
-            f"[REFUSED — bash {first} {url!r} would bypass web_fetch's "
+            f"{REFUSED_PREFIX}bash {first} {url!r} would bypass web_fetch's "
             "cache, condense pipeline, and URL guard for a URL already "
             "fetched in this session. To find a specific value within "
             "the page, call `find_in_url(url, needle)`. To navigate to "
@@ -4696,7 +5191,7 @@ class CachedDispatcher:
         if n < self._url_fetch_max:
             return None
         return (
-            f"[REFUSED — URL fetched {n} times already in this session: "
+            f"{REFUSED_PREFIX}URL fetched {n} times already in this session: "
             f"{url!r}. The body is in your context. To find a specific "
             "phrase or value, call `find_in_url(url, needle)` instead. "
             "To navigate within a long doc, call `web_outline(url)` and "
@@ -4710,7 +5205,7 @@ class CachedDispatcher:
         if self.web_fetch_count < self._web_fetch_max:
             return None
         return (
-            f"[REFUSED — web_fetch cap of {self._web_fetch_max} reached. "
+            f"{REFUSED_PREFIX}web_fetch cap of {self._web_fetch_max} reached. "
             "STOP fetching. Synthesize from pages already fetched + "
             "call done(). Do NOT issue more web_fetch calls.]"
         )
@@ -4724,7 +5219,7 @@ class CachedDispatcher:
         norm = _normalize_url(url)
         if norm and norm in self._dead_urls:
             return (
-                f"[REFUSED — URL {url!r} previously returned an error or "
+                f"{REFUSED_PREFIX}URL {url!r} previously returned an error or "
                 "was a block page in this session. Don't retry. Use a "
                 "different source.]"
             )
@@ -4764,6 +5259,15 @@ class CachedDispatcher:
         # `something.docs.python.org`) — keeps the list short.
         if any(host.endswith("." + h) or host == h for h in approved):
             return None
+        # Iter 37 (loosen-for-finance): IR / investor-relations subdomains
+        # follow canonical patterns across virtually all public companies.
+        # `ir.netflix.com`, `investor.apple.com`, `investors.tjx.com`,
+        # `corp.aapl.com` etc. — the host is the company itself, no slug
+        # to fabricate. The narrowness of the prefix list (must START with
+        # one of these tokens) keeps the false-positive surface tiny:
+        # generic hosts like `news.example.com` are still refused.
+        if any(host.startswith(p) for p in _IR_SUBDOMAIN_PREFIXES):
+            return None
         self._url_guard_refusals += 1
         if self._url_guard_refusals >= 3:
             tail = (" You have been refused multiple times — STOP fabricating "
@@ -4771,7 +5275,7 @@ class CachedDispatcher:
         else:
             tail = ""
         return (
-            f"[REFUSED — URL {url!r} not seen in any prior search result, "
+            f"{REFUSED_PREFIX}URL {url!r} not seen in any prior search result, "
             "fetch result, or user message. The model often hallucinates "
             "product/page slugs that look real but 404. Run web_search "
             "first, then web_fetch a URL from those results verbatim." + tail
@@ -4828,14 +5332,22 @@ class CachedDispatcher:
             self.fs_call_counts.clear()
             return dispatch(fn, args), False
         key = (fn, _arg_key(args))
+        # Iter 37 (loosen-for-finance): exact-duplicate call cap is the LAST
+        # backstop after the cache markers + near-dup detection. Hardcoded
+        # cap=3 was too tight for multi-period finance research where a
+        # model legitimately retries the same query after a related variant
+        # got near-dup-blocked. Bumped 3 → 5 (env-tunable). The cached-marker
+        # response at counts 1-4 still tells the model the call was a no-op
+        # — only at 5 does it hard-refuse.
+        _dup_call_max = int(os.environ.get("QWEN_DUP_CALL_MAX", "5"))
         if fn in _FS_READ_TOOLS:
             entry = self._get(self.fs_cache, key)
             if entry is not None and entry[0] == self.fs_generation:
                 self.fs_call_counts[key] = self.fs_call_counts.get(key, 0) + 1
                 n = self.fs_call_counts[key]
-                if n >= 3:
+                if n >= _dup_call_max:
                     return (
-                        f"[REFUSED — duplicate filesystem read #{n} of {fn}({_arg_key(args)}). "
+                        f"{REFUSED_PREFIX}duplicate filesystem read #{n} of {fn}({_arg_key(args)}). "
                         "Same result already in this conversation. Stop re-reading. "
                         "If you need different info, change the args; otherwise synthesize."
                     ), True
@@ -4879,9 +5391,9 @@ class CachedDispatcher:
             if cached is not None:
                 self.web_call_counts[key] = self.web_call_counts.get(key, 0) + 1
                 n = self.web_call_counts[key]
-                if n >= 3:
+                if n >= _dup_call_max:
                     return (
-                        f"[REFUSED — duplicate web call #{n} of {fn}({_arg_key(args)}). "
+                        f"{REFUSED_PREFIX}duplicate web call #{n} of {fn}({_arg_key(args)}). "
                         "Same query already answered above; further repeats blocked. "
                         "Move on to a different question or synthesize an answer "
                         "from what's already gathered."
@@ -5054,7 +5566,7 @@ class CachedDispatcher:
             # them inside dispatch().
             if fn in _WEB_READ_TOOLS:
                 out.append((
-                    f"[REFUSED — parallel duplicate of {fn}({_arg_key(args)}) "
+                    f"{REFUSED_PREFIX}parallel duplicate of {fn}({_arg_key(args)}) "
                     "issued earlier in THIS turn. You fired the same call "
                     "more than once in parallel; the result is already in "
                     "your context. Stop replicating the same query and either "
@@ -5531,7 +6043,22 @@ TOOLS: list[dict] = [
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "ONLY set this if you specifically want a smaller result (e.g. you know the answer is in the first paragraph). The default (300000) lets the full page reach the relevance-ranked condenser; passing a lower value chops the middle of the page BEFORE condensation runs and may discard the data you need. For reference documents (SEC filings, annual reports, papers) leave unset.",
+                        "description": "LEAVE UNSET for reference docs (filings, annual reports, papers, long articles). The default (3000000) feeds the full stripped body into the condenser, which picks the most relevant chunks regardless of where they sit in the page. Passing a smaller value chops the body BEFORE the condenser runs and may discard the section you need. Only set when you specifically want less content (e.g. just the first paragraph).",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["numerical", "semantic"],
+                        "description": (
+                            "Retrieval profile for the condenser. Default 'semantic'. "
+                            "Pick 'numerical' when the answer is stated verbatim in the source — a "
+                            "specific value, count, name, date, or list item that you expect to find "
+                            "as a literal substring of the fetched content. Uses lexical + structural "
+                            "ranking only; tables and numeric content survive intact. "
+                            "Pick 'semantic' when the answer is a synthesis, judgment, or inference "
+                            "built from prose — derived across multiple sentences rather than stated "
+                            "verbatim. Engages a semantic reranker that scores passages by whether "
+                            "they actually answer the question, not just by lexical overlap."
+                        ),
                     },
                 },
                 "required": ["url"],
@@ -5878,12 +6405,18 @@ TOOLS: list[dict] = [
             "name": "list_files",
             "description": (
                 "List files under a path, optionally filtered by a glob pattern. "
-                "Use this to discover the layout of a project before reading files."
+                "Use this to discover the layout of a project before reading files. "
+                "SCOPE: stay within the current working directory (the active "
+                "project tree). Do NOT list the home directory itself, '/', "
+                "'/Users', '/Library', etc. — those expose personal data, "
+                "credentials, and app state. If the file you want isn't in "
+                "the project, fetch from the web or open it by full path with "
+                "read_file."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Directory to list (default: cwd)."},
+                    "path": {"type": "string", "description": "Directory to list (default: cwd). Must be inside the project tree — broad scopes like '~', '/', or '/Users' are off limits."},
                     "pattern": {
                         "type": "string",
                         "description": "Glob pattern, e.g. '**/*.py' or 'src/**/*.ts' (default: '**/*').",
@@ -5900,13 +6433,22 @@ TOOLS: list[dict] = [
                 "Regex-search file contents under a path. Use this to locate code "
                 "by symbol or keyword before reading whole files. Always prefer "
                 "grep over reading entire files. VCS dirs (.git/.hg/etc) are "
-                "excluded automatically."
+                "excluded automatically. "
+                "SCOPE: never grep the home directory itself, '/', '/Users', "
+                "'/Library', '/System', '/etc', '/var', '/usr', or any other "
+                "top-level system / user dir — those hold ssh keys, browser "
+                "data, app state, and personal documents which must not be "
+                "pulled into context. Default to the current working directory "
+                "(the active project) or a named subfolder under it. If the "
+                "data you need isn't in the project tree, you're using the "
+                "wrong tool — use web_fetch / sec_filings / read_file on a "
+                "specific path instead."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Regex pattern."},
-                    "path": {"type": "string", "description": "Directory or file (default: cwd)."},
+                    "path": {"type": "string", "description": "Directory or file (default: cwd). Stay within the project tree — the home dir, '/', and system roots are off limits."},
                     "glob": {
                         "type": "string",
                         "description": "Restrict to files matching this glob (e.g. '*.py').",
