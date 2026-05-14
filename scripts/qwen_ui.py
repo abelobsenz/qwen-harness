@@ -232,6 +232,9 @@ _TEXT_LIKE_EXTS = {
 
 _PDF_EXTS = {".pdf"}
 
+# Image extensions we can OCR via tesseract.
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+
 
 def _safe_filename(name: str) -> str:
     """Strip directory components and dangerous chars. We still always
@@ -342,8 +345,76 @@ def _extract_text_from_upload(path: Path, ext: str, ctype: str) -> tuple[str, st
             except UnicodeDecodeError:
                 continue
         return raw.decode("utf-8", "replace"), None
+    # Images — OCR via tesseract if available, else return a clear
+    # "this is an image, the model can't see it" marker so the model
+    # doesn't pretend it's a file path it can `read_file`. Image bytes
+    # are stripped from the inline payload either way (qwen3.6 here is
+    # text-only).
+    if ext in _IMAGE_EXTS or (ctype or "").startswith("image/"):
+        return _ocr_image(path)
     # Anything else — best to acknowledge it without dumping bytes.
     return "", None
+
+
+def _ocr_image(path: Path) -> tuple[str, str | None]:
+    """Run tesseract on `path` and return (extracted_text, error_or_None).
+
+    Falls back to an informative "[image attachment ... model can't see
+    images directly]" marker when tesseract is unavailable or yields
+    nothing useful — without this, the chat prompt would carry an empty
+    `<details>` block and the model would invent a `read_file` call for
+    the filename, which is what the user just hit.
+    """
+    import shutil
+    import subprocess
+    tess = shutil.which("tesseract")
+    if not tess:
+        return (
+            f"[image attachment: {path.name} — OCR unavailable on this "
+            f"machine (tesseract not in PATH). The model is text-only "
+            f"and can't see the image directly. Describe what you want "
+            f"checked, or paste any text from the image inline.]",
+            None,
+        )
+    try:
+        # tesseract <input> stdout -- writes extracted text to stdout.
+        r = subprocess.run(
+            [tess, str(path), "stdout", "-l", "eng"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"[image attachment: {path.name} — OCR timed out after 30s. "
+            f"The image was saved but its text content couldn't be "
+            f"extracted. The model can't see images directly.]",
+            "ocr timeout",
+        )
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"[image attachment: {path.name} — OCR failed: "
+            f"{type(e).__name__}: {e}. The model can't see images directly.]",
+            f"ocr error: {e}",
+        )
+    text = (r.stdout or "").strip()
+    if not text or len(text) < 8:
+        # Tesseract sometimes "succeeds" with a few stray glyphs on a
+        # screenshot of a UI. Below 8 chars almost always means it
+        # didn't find any meaningful text — surface that clearly rather
+        # than letting the model think the image is empty.
+        return (
+            f"[image attachment: {path.name} — saved, but OCR found "
+            f"no readable text ({len(text)} chars). The model is "
+            f"text-only and can't see the image content directly. "
+            f"Ask the user to describe what's in it, or to paste any "
+            f"text from it inline.]",
+            None,
+        )
+    # Successful OCR — wrap with a header so the model knows this is
+    # transcribed image text, not a file the user wrote.
+    return (
+        f"[OCR'd from image attachment: {path.name}]\n\n{text}",
+        None,
+    )
 
 
 def _read_upload_text(upload_id: str) -> tuple[str, dict] | tuple[None, dict]:
@@ -861,6 +932,12 @@ _CHAT_KEEP_TOOLS = frozenset({
     # redundant with search since search returns content. Without delete,
     # stale memories accumulate and search returns more bad hits over time.
     "memory_save", "memory_search", "memory_delete",
+    # scratchpad covers transient in-task notes (no memory pollution);
+    # ask_user gives the model a clean exit from ambiguous prompts so it
+    # doesn't loop on guessing; graph_compose lets a chat session escalate
+    # into a graph mid-conversation without context-switching to the
+    # graph-designer panel.
+    "scratchpad", "ask_user", "graph_compose",
     "pdf_extract", "make_table", "python_run", "inspect_data",
     "agent_graph_list", "agent_graph_run",
 })
@@ -974,11 +1051,25 @@ def _terse_tools(tools: list[dict]) -> list[dict]:
 # tool-use guidance, anti-loop discipline, quantitative metadata checks,
 # no-preamble behavior, fenced code blocks, and ASCII-LaTeX for math.
 _CHAT_SYSTEM_STATIC = (
-    "Concise. Call tools when needed, else answer directly. No preambles. "
-    "Code in fenced blocks.\n"
+    "Concise. Call tools when needed, else answer directly. No preambles, no "
+    "'Sure'/'Certainly' openers. Code in fenced blocks.\n"
+    "Before your first tool call, state in one sentence what you're about to "
+    "do — the user can't see tool calls. Don't narrate deliberation. "
+    "End-of-turn summary: 1-2 sentences, what changed and what's next.\n"
+    "Match the user's requested output format exactly — no extra columns, "
+    "fields, debug output, or commentary they didn't ask for.\n"
     "Use one short planning pass, then act. If uncertain, convert the "
     "uncertainty into one concrete check; after that check, proceed, answer "
-    "with caveats, or stop. Repeated self-questioning is a stop signal.\n"
+    "with caveats, or stop. Repeated self-questioning is a stop signal. "
+    "If the request is genuinely ambiguous in a way that changes the "
+    "deliverable, call `ask_user(question, options)` rather than guessing.\n"
+    "Graphs and subagents: when the task decomposes into research → analyze "
+    "→ produce, call `agent_graph_list` to see existing graphs and "
+    "`agent_graph_run` to launch one — each node has its own context, so "
+    "this is the right move for multi-step pipelines that would otherwise "
+    "blow the window. `graph_compose(description)` builds a fresh graph if "
+    "none fit. Trust but verify: read the artifact a subagent claims to "
+    "have written before forwarding the claim.\n"
     "`[cached…]` means the same evidence is already available; use it or "
     "change a real dimension, not wording. `[REFUSED…]` is final for that "
     "tool path — synthesize from above; if the answer isn't there, say so "
@@ -992,6 +1083,14 @@ _CHAT_SYSTEM_STATIC = (
     "the same data point. After near-duplicate/cached/empty/refused results, "
     "fetch a promising result, use a specialized tool or `find_in_url`, or "
     "synthesize.\n"
+    "Comments: default to writing none. Only when the WHY is non-obvious "
+    "(hidden constraint, subtle invariant, surprising behavior). Never "
+    "explain WHAT well-named code does, and never reference the current "
+    "task/fix/callers — those belong in the PR description.\n"
+    "Reversibility: local edits/reads — proceed freely. Hard-to-reverse or "
+    "shared-state actions (`git push`, force-push, dropping tables, "
+    "modifying CI, `--no-verify`) — confirm with the user before each one, "
+    "even if a similar action was approved earlier.\n"
     # Synced from scripts/agent.py SYSTEM_PROMPT_STATIC. Keep these two
     # blocks (Quantitative answers + Sibling-metric ambiguity) in sync
     # across the two surfaces so the chat tab and headless agent give
@@ -1038,6 +1137,23 @@ def _chat_system_prompt(cwd: str) -> str:
         + "(`AI news 2026`, not `AI news`). Use `now` only for timezone math.\n"
         + f"Cwd: {cwd}.\n"
     )
+
+
+# Slash-command help rendered on `/help`. Module-level so the test harness
+# (which exercises the routing on a duck-typed handler) can reach it.
+_SLASH_HELP = (
+    "**Chat slash commands** — these run server-side without invoking the model:\n\n"
+    "- `/help` — show this help\n"
+    "- `/graphs` — list available agent graphs (compact table)\n"
+    "- `/graph <name> [json-inputs]` — run a graph; events stream inline\n"
+    "  e.g. `/graph market_research {\"topic\": \"US equities today\"}`\n"
+    "- `/graph_compose <description>` — design + save a fresh graph from a natural-language paragraph\n"
+    "- `/scratchpad [read|clear] [key]` — show/clear in-task notes (default: read default pad)\n"
+    "- `/tools` — show the chat-tier tool list (one line each)\n\n"
+    "Anything not starting with `/` is sent to the model normally. "
+    "Slash commands are also still available **inside** a model response: "
+    "the model itself can call `agent_graph_run`, `graph_compose`, `scratchpad`, etc."
+)
 
 
 def _sse_frame(event: str, data: dict) -> bytes:
@@ -2726,6 +2842,276 @@ class UIHandler(BaseHTTPRequestHandler):
 
     # ----- chat ------------------------------------------------------------
 
+    def _maybe_handle_slash_command(self, cmd_line: str,
+                                      client_messages: list[dict],
+                                      session_id: str,
+                                      cwd: str) -> bool:
+        """Server-side slash-command router. Returns True if the command was
+        handled (response streamed, SSE closed). Returns False if the input
+        wasn't a recognized slash command — caller continues to the model.
+
+        Each command emits its result through the same SSE channel the
+        model uses so the UI renders it identically. The synthetic assistant
+        reply is persisted to the session so reloading the page shows it.
+        """
+        # Tokenize the command. Special-case `/graph` (single slash, two
+        # subcommands) and `/graph_compose` (underscore).
+        line = cmd_line.lstrip()
+        if not line.startswith("/"):
+            return False
+        head, _, rest = line[1:].partition(" ")
+        rest = rest.strip()
+        cmd = head.lower()
+
+        # Reject unknown slash commands — pass through to model so the model
+        # can interpret things like "/api/foo" the user pasted accidentally.
+        if cmd not in {"help", "graphs", "graph", "graph_compose",
+                        "scratchpad", "tools"}:
+            return False
+
+        # Open SSE response and stream the synthetic reply.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        # We hold the per-session lock for the synthetic reply just like a
+        # model call would — prevents another tab from racing in.
+        session_lock = _session_chat_lock(session_id)
+        if not session_lock.acquire(blocking=False):
+            self.wfile.write(_sse_frame("error", {
+                "message": "another chat is in flight for this session",
+            }))
+            return True
+
+        write_lock = threading.Lock()
+        closed = {"v": False}
+
+        def emit(event: str, data: dict) -> None:
+            if closed["v"]:
+                return
+            try:
+                with write_lock:
+                    self.wfile.write(_sse_frame(event, data))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                closed["v"] = True
+
+        def emit_text(text: str) -> None:
+            # Stream as a `content` event with a `delta` field so the UI's
+            # existing chat-renderer (which already handles model streaming)
+            # treats this identically to a model response.
+            for chunk in [text[i:i+512] for i in range(0, len(text), 512)]:
+                emit("content", {"delta": chunk})
+
+        try:
+            emit("started", {
+                "session_id": session_id,
+                "queue": DISPATCHER.queue_depth(),
+                "slash": cmd,
+            })
+
+            reply_text = ""
+            if cmd == "help":
+                reply_text = _SLASH_HELP
+
+            elif cmd == "tools":
+                from agent_tools import _filtered_tools as _ft  # type: ignore
+                tools = _chat_tool_tier(_ft())
+                lines = ["**Chat-tier tools** (in addition to anything the model calls):\n"]
+                for t in tools:
+                    fn = (t.get("function") or {})
+                    name = fn.get("name", "?")
+                    blurb = _CHAT_TOOL_BLURBS.get(name) or (
+                        (fn.get("description") or "").split(". ", 1)[0][:120]
+                    )
+                    lines.append(f"- `{name}` — {blurb}")
+                reply_text = "\n".join(lines)
+
+            elif cmd == "graphs":
+                info = _list_graphs()
+                graphs = info.get("graphs") or []
+                if not graphs:
+                    reply_text = "_no graphs defined under `examples/`._"
+                else:
+                    lines = ["**Available graphs** (call `/graph <name> [json-inputs]` to run):\n"]
+                    lines.append("| name | nodes | entry inputs |")
+                    lines.append("|---|---|---|")
+                    for g in graphs:
+                        inputs = ", ".join(g.get("entry_inputs") or []) or "—"
+                        lines.append(
+                            f"| `{g.get('name','?')}` | {g.get('nodes','?')} | {inputs} |"
+                        )
+                    reply_text = "\n".join(lines)
+
+            elif cmd == "graph":
+                # `/graph <name> {json}` — run a graph and stream events.
+                if not rest:
+                    reply_text = (
+                        "Usage: `/graph <name> [json-inputs]`. "
+                        "Run `/graphs` to see available graphs."
+                    )
+                else:
+                    name, _, inputs_raw = rest.partition(" ")
+                    name = name.strip()
+                    try:
+                        inputs = (json.loads(inputs_raw.strip())
+                                  if inputs_raw.strip() else {})
+                    except json.JSONDecodeError as e:
+                        reply_text = f"**Error**: inputs must be valid JSON ({e})."
+                    else:
+                        try:
+                            g, gpath = _resolve_graph(name)
+                        except FileNotFoundError as e:
+                            reply_text = f"**Error**: {e}"
+                        except Exception as e:  # noqa: BLE001
+                            reply_text = (f"**Error**: failed to load graph "
+                                          f"`{name}`: {type(e).__name__}: {e}")
+                        else:
+                            # Stream events inline. Each node_start /
+                            # node_end shows up as a short status line in
+                            # the chat so the user sees progress.
+                            emit_text(
+                                f"**Running graph `{name}`** with inputs "
+                                f"`{json.dumps(inputs)}`…\n\n"
+                            )
+                            events_log: list[dict] = []
+                            def _cb(ev: dict) -> None:
+                                events_log.append(ev)
+                                k = ev.get("kind", "?")
+                                if k == "node_start":
+                                    emit_text(f"- ▸ `{ev.get('node','?')}` starting\n")
+                                elif k == "node_end":
+                                    wall = ev.get("wall_s")
+                                    nstr = (f" ({wall:.1f}s)"
+                                             if isinstance(wall, (int, float))
+                                             else "")
+                                    emit_text(f"- ✓ `{ev.get('node','?')}` done{nstr}\n")
+                                elif k == "node_skipped":
+                                    emit_text(f"- ⊘ `{ev.get('node','?')}` skipped\n")
+                            graph_name = getattr(g, "name", os.path.basename(gpath))
+                            run_id = _new_graph_run_id()
+                            started_iso = _dt.datetime.now().isoformat(timespec="seconds")
+                            t0 = time.monotonic()
+                            try:
+                                out = g.run(inputs, verbose=False,
+                                             max_parallel=4, event_cb=_cb)
+                                wall = round(time.monotonic() - t0, 2)
+                                _persist_graph_run({
+                                    "run_id": run_id, "graph": graph_name,
+                                    "started_at": started_iso,
+                                    "ended_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                                    "wall_s": wall, "ok": True,
+                                    "inputs": inputs, "outputs": out,
+                                    "events": events_log,
+                                })
+                                # Render outputs as collapsed details blocks.
+                                emit_text(f"\n**Done in {wall}s** "
+                                          f"(run id `{run_id}`). Outputs:\n\n")
+                                for node, outputs in (out or {}).items():
+                                    if isinstance(outputs, dict) and outputs.get("_skipped"):
+                                        continue
+                                    emit_text(f"<details><summary><code>{node}</code></summary>\n\n")
+                                    emit_text("```json\n" + json.dumps(outputs, indent=2, default=str) + "\n```\n\n")
+                                    emit_text("</details>\n\n")
+                                reply_text = ""  # already streamed
+                            except Exception as e:  # noqa: BLE001
+                                _persist_graph_run({
+                                    "run_id": run_id, "graph": graph_name,
+                                    "started_at": started_iso,
+                                    "ended_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                                    "wall_s": None, "ok": False,
+                                    "error": f"{type(e).__name__}: {e}",
+                                    "inputs": inputs, "outputs": {},
+                                    "events": events_log,
+                                })
+                                emit_text(f"\n**Error**: {type(e).__name__}: {e}\n")
+                                reply_text = ""
+
+            elif cmd == "graph_compose":
+                if not rest or len(rest.strip()) < 8:
+                    reply_text = ("Usage: `/graph_compose <description ≥8 chars>`. "
+                                   "Provide a paragraph describing the pipeline.")
+                else:
+                    emit_text(f"**Designing graph from**:\n\n> {rest[:300]}…\n\n")
+                    _ensure_scripts_on_path()
+                    try:
+                        from graph_designer import design_and_save  # type: ignore
+                    except Exception as e:  # noqa: BLE001
+                        reply_text = f"**Error**: graph_designer unavailable ({e})."
+                    else:
+                        DISPATCHER.acquire(PRIO_NORMAL, label="slash_graph_compose")
+                        try:
+                            result = design_and_save(rest)
+                        except Exception as e:  # noqa: BLE001
+                            reply_text = f"**Error**: {type(e).__name__}: {e}"
+                            result = None
+                        finally:
+                            DISPATCHER.release()
+                        if isinstance(result, dict) and result.get("ok"):
+                            name = result.get("name", "?")
+                            path = result.get("path", "?")
+                            spec = result.get("spec") or {}
+                            n_nodes = len(spec.get("nodes") or [])
+                            reply_text = (
+                                f"**Saved graph `{name}`** "
+                                f"({n_nodes} nodes) at `{path}`.\n\n"
+                                f"Run it with `/graph {name} {{...}}` or call "
+                                f"`agent_graph_run` from a model turn."
+                            )
+                        elif result is not None:
+                            reply_text = (
+                                f"**Design rejected**: "
+                                f"{result.get('error', 'unknown error')}"
+                            )
+
+            elif cmd == "scratchpad":
+                # `/scratchpad [read|clear] [key]`. Default: read default pad.
+                tokens = rest.split() if rest else []
+                action = tokens[0].lower() if tokens else "read"
+                key = tokens[1] if len(tokens) > 1 else "default"
+                try:
+                    from agent_tools import scratchpad as _sp
+                    out = _sp(action=action, key=key, content="")
+                except Exception as e:  # noqa: BLE001
+                    out = f"[error] {type(e).__name__}: {e}"
+                reply_text = "```\n" + out + "\n```"
+
+            if reply_text:
+                emit_text(reply_text)
+
+            # Persist the synthetic exchange to the session so a reload
+            # shows it identically to a model response.
+            new_messages = list(client_messages)
+            # The latest user msg is already in new_messages. Append the
+            # assistant synthetic message AFTER it.
+            synthetic_content = reply_text or "(slash command output streamed above)"
+            new_messages.append({
+                "role": "assistant",
+                "content": synthetic_content,
+            })
+            try:
+                _persist_session(session_id, new_messages)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("session persist failed (slash): %s", e)
+
+            emit("done", {
+                "session_id": session_id,
+                "messages": _strip_messages_for_client(new_messages),
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.exception("slash command crashed: %s", cmd)
+            emit("error", {"message": f"slash error: {type(e).__name__}: {e}"})
+        finally:
+            try:
+                session_lock.release()
+            except (RuntimeError, NameError):
+                pass
+        return True
+
     def _handle_chat_stream(self) -> None:
         body = _read_json_body(self)
         if body is None:
@@ -2798,6 +3184,32 @@ class UIHandler(BaseHTTPRequestHandler):
                 {"role": "system", "content": _chat_system_prompt(cwd)},
                 *client_messages,
             ]
+
+        # Slash-command interception. If the latest user message is a slash
+        # command (`/graphs`, `/graph <name>`, `/graph_compose <desc>`,
+        # `/scratchpad ...`, `/help`), handle it server-side and short-
+        # circuit the model call. The synthetic assistant reply is streamed
+        # back via the same SSE channel so the UI renders it identically to
+        # a model response. This is the chat<->graph integration: the user
+        # can directly invoke graph operations from the chat box without
+        # leaving the conversation for the graphs panel.
+        last_user = None
+        for m in reversed(client_messages):
+            if m.get("role") == "user":
+                last_user = m
+                break
+        if (last_user is not None
+                and isinstance(last_user.get("content"), str)
+                and last_user["content"].lstrip().startswith("/")
+                and not body.get("skip_slash")):
+            handled = self._maybe_handle_slash_command(
+                last_user["content"].strip(),
+                client_messages,
+                session_id,
+                cwd,
+            )
+            if handled:
+                return
 
         # Merge file attachments into the LATEST user message (if any).
         # The client sends `attachments` as a list of upload IDs from
