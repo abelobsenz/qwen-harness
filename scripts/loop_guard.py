@@ -81,6 +81,23 @@ class LoopGuardConfig:
     phrase_min_len: int = int(os.environ.get("LOOP_GUARD_PHRASE_MIN_LEN", "25"))
     phrase_max_len: int = int(os.environ.get("LOOP_GUARD_PHRASE_MAX_LEN", "200"))
     phrase_min_repeats: int = int(os.environ.get("LOOP_GUARD_PHRASE_REPEATS", "4"))
+    # Think-block overflow detector. Qwen3.6's chat template auto-prepends
+    # `<think>` so the streamed response starts INSIDE the reasoning block;
+    # the first `</think>` marks the transition to visible content / tool
+    # calls. If the model accumulates >`think_block_max_bytes` of streamed
+    # text before emitting `</think>` or a `<tool_call>` opener, the
+    # reasoning has runaway and the agent will hit its per-prompt timeout
+    # mid-decode without producing any actionable output. This was the
+    # NFLX-pattern TIMEOUT we couldn't detect before — content is novel
+    # each token so suffix/n-gram/phrase detectors don't fire; chunks ARE
+    # flowing so the streaming idle-timeout doesn't fire either.
+    #
+    # 12000 bytes ≈ 3000 tokens ≈ ~120 s of decode at 24 TPS — well past
+    # any realistic "plan first then act" pass on the prompts that PASS
+    # in <60 s, but well before the 600 s eval timeout. Set
+    # LOOP_GUARD_THINK_BLOCK_MAX=0 to disable.
+    think_block_max_bytes: int = int(os.environ.get(
+        "LOOP_GUARD_THINK_BLOCK_MAX", "12000"))
 
 
 @dataclass(frozen=True)
@@ -394,6 +411,14 @@ class StreamingLoopGuard:
 
     The window is bounded by NGRAM_WINDOW + 1 KB headroom; memory is
     constant regardless of total stream length.
+
+    Also tracks **cumulative think-block bytes** independent of the
+    sliding window — see `_check_think_block_overflow` below. The
+    sliding-window detectors look at the latest N chars; the think-block
+    guard needs total bytes from stream start (and whether `</think>`
+    or `<tool_call>` has shown up yet) because the failure mode is
+    "decoded N kB of unique novel reasoning without ever emitting a
+    closing tag or a tool call."
     """
 
     def __init__(self, cfg: Optional[LoopGuardConfig] = None,
@@ -415,18 +440,57 @@ class StreamingLoopGuard:
         # Need to keep enough history for the WIDEST detector window —
         # phrase detector uses up to phrase_window chars. Add 1 KB headroom.
         self._max_window = max(self.cfg.ngram_window, self.cfg.phrase_window) + 1024
+        # ---- think-block overflow tracking ----
+        # Cumulative streamed bytes (never resets, unlike _buf which
+        # gets compacted). Sliding-window detectors use _buf for memory
+        # bound; this counter is for "have we accumulated too much think
+        # without resolution."
+        self._total_bytes = 0
+        # Track whether we've seen the close-think marker. Qwen3.6's
+        # chat template auto-prepends `<think>` so we only watch for
+        # the closing `</think>`. Once seen, the model is producing
+        # visible content / tool calls and the guard no longer fires.
+        self._saw_close_think = False
+        # Track first `<tool_call>` opener. If the model emits a tool
+        # call without thinking (some routine turns) or after a short
+        # think, we treat that as "made productive progress" and the
+        # guard stays quiet.
+        self._saw_tool_call = False
 
     def observe(self, chunk: str) -> LoopReport:
         if not chunk:
             return LoopReport(triggered=False)
         self._buf.append(chunk)
         self._buf_len += len(chunk)
-        # Compact periodically so total memory is bounded.
+        self._total_bytes += len(chunk)
+        # Cheap markers — substring checks are sub-microsecond per chunk.
+        if not self._saw_close_think and "</think>" in chunk:
+            self._saw_close_think = True
+        if not self._saw_tool_call and "<tool_call>" in chunk:
+            self._saw_tool_call = True
+        # Compact periodically so total memory is bounded EVEN IF the
+        # caller keeps feeding past a triggered report (well-behaved
+        # callers stop on trigger, but the guard must stay constant-
+        # memory in either case).
         if self._buf_len > self._max_window * 2:
             joined = "".join(self._buf)[-self._max_window :]
             self._buf = [joined]
             self._buf_len = len(joined)
-        # Don't run detection on every token — too expensive.
+            # Reset gate so the next observe() can re-run the windowed
+            # detectors immediately — without this, post-compaction
+            # `_buf_len - _last_check_at` is negative and the gate
+            # silently skips detection until enough new bytes
+            # accumulate, which can mask short loops in the trailing
+            # window for thousands of bytes.
+            self._last_check_at = self._buf_len
+        # ---- think-block overflow check (cheap, O(1), runs every chunk) ----
+        # Placed AFTER compaction (so memory stays bounded) but BEFORE
+        # the check_every gate (so it doesn't depend on sliding-window
+        # _buf_len; cumulative _total_bytes is what drives this).
+        tb_report = self._check_think_block_overflow()
+        if tb_report.triggered:
+            return tb_report
+        # Don't run windowed detection on every token — too expensive.
         if self._buf_len - self._last_check_at < self.check_every:
             return LoopReport(triggered=False)
         self._last_check_at = self._buf_len
@@ -435,6 +499,29 @@ class StreamingLoopGuard:
         # would appear.
         tail = "".join(self._buf)[-self._max_window :]
         return check_text(tail, self.cfg)
+
+    def _check_think_block_overflow(self) -> "LoopReport":
+        """Fire when the model has streamed >`think_block_max_bytes` of
+        text without closing `</think>` and without emitting any
+        `<tool_call>`. Catches the runaway-reasoning failure mode where
+        the model decodes novel content for ~600 s without progressing.
+
+        Only inspects cumulative byte counts + the two cheap booleans
+        updated above. O(1) per call."""
+        if self.cfg.think_block_max_bytes <= 0:
+            return LoopReport(triggered=False)
+        if self._saw_close_think or self._saw_tool_call:
+            return LoopReport(triggered=False)
+        if self._total_bytes < self.cfg.think_block_max_bytes:
+            return LoopReport(triggered=False)
+        return LoopReport(
+            triggered=True,
+            reason="think-block-overflow",
+            detail=(f"streamed {self._total_bytes} bytes inside `<think>` "
+                    f"without `</think>` or `<tool_call>` (threshold "
+                    f"{self.cfg.think_block_max_bytes})"),
+            repeated_chunk="",
+        )
 
     def finalize(self) -> LoopReport:
         """Run one final detector pass on the entire buffered tail. Call
@@ -598,6 +685,78 @@ def _run_self_tests() -> int:
         "def baz():\n    return 3\n\nif __name__ == '__main__':\n    foo()\n"
     )
     expect_clean("python code with repetitive imports", code_sample)
+
+    # Think-block overflow detector tests.
+    print("\n[7] Think-block overflow detector:")
+
+    def feed_stream(guard: StreamingLoopGuard, text: str,
+                    chunk_size: int = 256) -> LoopReport:
+        rep = LoopReport(triggered=False)
+        for i in range(0, len(text), chunk_size):
+            rep = guard.observe(text[i: i + chunk_size])
+            if rep.triggered:
+                return rep
+        return rep
+
+    # 16 KB of unique reasoning content with no </think> and no <tool_call>
+    # MUST fire the think-block guard.
+    import random as _rnd2
+    rng = _rnd2.Random(42)
+    # Build varied prose (different sentences) so suffix/n-gram detectors
+    # don't fire instead of our new detector.
+    words = ("the agent computes a hypothesis from prior evidence and "
+             "considers whether to invoke a tool or to commit to an "
+             "answer based on its confidence and available context "
+             "while accounting for the budget remaining in this turn").split()
+    long_think = ""
+    while len(long_think) < 16000:
+        long_think += " ".join(rng.choice(words) for _ in range(20)) + ". "
+    g = StreamingLoopGuard()
+    rep = feed_stream(g, long_think)
+    ok = rep.triggered and rep.reason == "think-block-overflow"
+    print(f"  [{'✓' if ok else '✗'}] 16 KB unclosed <think> stream fires "
+          f"think-block-overflow (got reason={rep.reason!r}, "
+          f"total_bytes={g._total_bytes})")
+    if not ok:
+        failures += 1
+
+    # 16 KB stream that emits </think> at ~4 KB then keeps going as visible
+    # content MUST NOT fire — model is producing real output now.
+    g = StreamingLoopGuard()
+    chunk_a = long_think[:4000]
+    chunk_b = "</think>\n\nHere is my analysis: " + long_think[4000:]
+    rep = feed_stream(g, chunk_a + chunk_b)
+    ok = not (rep.triggered and rep.reason == "think-block-overflow")
+    print(f"  [{'✓' if ok else '✗'}] long stream with </think> at 4 KB "
+          f"does NOT fire think-block-overflow (reason={rep.reason!r})")
+    if not ok:
+        failures += 1
+
+    # 16 KB stream that emits a <tool_call> early MUST NOT fire — model
+    # is making progress via tools.
+    g = StreamingLoopGuard()
+    chunk_a = long_think[:3000] + "<tool_call><function=web_search>" + long_think[3000:]
+    rep = feed_stream(g, chunk_a)
+    ok = not (rep.triggered and rep.reason == "think-block-overflow")
+    print(f"  [{'✓' if ok else '✗'}] long stream with <tool_call> at 3 KB "
+          f"does NOT fire think-block-overflow (reason={rep.reason!r})")
+    if not ok:
+        failures += 1
+
+    # Disabled mode (LOOP_GUARD_THINK_BLOCK_MAX=0) MUST disable the detector.
+    cfg_disabled = LoopGuardConfig(
+        suffix_min_len=24, suffix_repeats=4, ngram_window=600,
+        ngram_n=6, ngram_floor=0.45, min_text=200, enabled=True,
+        phrase_window=4000, phrase_min_len=25, phrase_max_len=200,
+        phrase_min_repeats=4, think_block_max_bytes=0,
+    )
+    g = StreamingLoopGuard(cfg=cfg_disabled)
+    rep = feed_stream(g, long_think)
+    ok = not (rep.triggered and rep.reason == "think-block-overflow")
+    print(f"  [{'✓' if ok else '✗'}] LOOP_GUARD_THINK_BLOCK_MAX=0 disables "
+          f"the detector (reason={rep.reason!r})")
+    if not ok:
+        failures += 1
 
     print(f"\n== {'PASS' if failures == 0 else 'FAIL'} "
           f"({failures} failure(s)) ==")
